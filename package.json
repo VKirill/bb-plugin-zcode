@@ -1,0 +1,53 @@
+{
+  "name": "bb-plugin-zcode",
+  "version": "0.4.0",
+  "description": "ZCode as a BB provider: chats that run on the ZCode desktop app (GLM-5.3 / GLM-5.3-Flash) on your Mac, driven through an accessibility bridge.",
+  "keywords": [
+    "bb-plugin",
+    "provider",
+    "zcode",
+    "acp",
+    "glm",
+    "z.ai"
+  ],
+  "license": "Apache-2.0",
+  "type": "module",
+  "engines": {
+    "bb": ">=0.46",
+    "bbPluginSdk": ">=0.6.49"
+  },
+  "scripts": {
+    "build": "bb plugin build",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test tests/*.test.mjs"
+  },
+  "bb": {
+    "name": "Провайдер ZCode",
+    "description": "Run BB chats on the ZCode desktop app (GLM-5.3-Flash, GLM-5.3) on your Mac: modes, automatic projects, parallel tasks, MCP.",
+    "branding": {
+      "icon": "./icons/zcode.svg"
+    },
+    "server": "./server.ts",
+    "host": "./host.ts",
+    "app": "./app.tsx"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "typescript": "^5.7.0"
+  },
+  "dependencies": {
+    "@get-bb/plugin-sdk": "0.6.49",
+    "zod": "^4.6.5"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/VKirill/bb-plugin-zcode.git"
+  },
+  "homepage": "https://github.com/VKirill/bb-plugin-zcode#readme",
+  "bugs": {
+    "url": "https://github.com/VKirill/bb-plugin-zcode/issues"
+  },
+  "author": "Kirill Vechkasov"
+}

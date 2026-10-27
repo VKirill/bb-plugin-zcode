@@ -1,0 +1,324 @@
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import test from "node:test";
+import { fileURLToPath } from "node:url";
+import { startAgent, text } from "./support/acp-client.mjs";
+
+const here = path.dirname(fileURLToPath(import.meta.url));
+const agentPath = path.join(here, "..", "bin", "zcode-acp.mjs");
+const fakePath = path.join(here, "support", "fake-zcbridge.mjs");
+
+function seedModels(dir) {
+  fs.mkdirSync(path.join(dir, ".zcode-bridge"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".zcode-bridge", "models.json"), JSON.stringify({ models: [{ name: "GLM-5.3-Flash", enabled: true }, { name: "GLM-5.3", enabled: true }], default: "GLM-5.3-Flash", at: Math.floor(Date.now() / 1000) }));
+}
+
+function setup(extraEnv = {}) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zcode-acp-test-"));
+  seedModels(dir);
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "zcode-acp-cwd-"));
+  const env = { HOME: dir, ZCODE_ACP_BRIDGE: fakePath, FAKE_ZC_DIR: dir, FAKE_ZC_ROOT: fs.realpathSync(cwd), ZCODE_ACP_SESSIONS: path.join(dir, "sessions.json"), ...extraEnv };
+  const agent = startAgent(process.execPath, [agentPath], env);
+  return { dir, cwd, agent, calls: () => (fs.existsSync(path.join(dir, "calls.log")) ? fs.readFileSync(path.join(dir, "calls.log"), "utf8").trim().split("\n") : []) };
+}
+const prompt = (agent, sessionId, t) => agent.request("session/prompt", { sessionId, prompt: [{ type: "text", text: t }] });
+
+test("initialize, session/new advertises models and reasoning, set_config_option", async () => {
+  const { agent } = setup();
+  const init = await agent.request("initialize", { protocolVersion: 1, clientCapabilities: {} });
+  assert.equal(init.agentCapabilities.loadSession, true);
+  const s = await agent.request("session/new", { cwd: "/tmp", mcpServers: [] });
+  const model = s.configOptions.find((o) => o.category === "model");
+  assert.deepEqual(model.options.map((o) => o.name), ["GLM-5.3-Flash", "GLM-5.3"]);
+  assert.equal(model.currentValue, "glm-5.3-flash");
+  assert.deepEqual(s.configOptions.find((o) => o.category === "thought_level").options.map((o) => o.value), ["low", "high", "max"]);
+  const r = await agent.request("session/set_config_option", { sessionId: s.sessionId, configId: "effort", value: "max" });
+  assert.equal(r.configOptions.find((o) => o.id === "effort").currentValue, "max");
+  await assert.rejects(agent.request("session/set_config_option", { sessionId: s.sessionId, configId: "model", value: "nope" }));
+  agent.close();
+});
+
+test("first turn uses send with model and effort, second turn uses continue, only new events are streamed", async () => {
+  const { agent, cwd, calls } = setup();
+  await agent.request("initialize", { protocolVersion: 1 });
+  const s = await agent.request("session/new", { cwd, mcpServers: [] });
+  await agent.request("session/set_config_option", { sessionId: s.sessionId, configId: "model", value: "glm-5.3" });
+  await agent.request("session/set_config_option", { sessionId: s.sessionId, configId: "effort", value: "low" });
+  const r1 = await prompt(agent, s.sessionId, "first tool please");
+  assert.equal(r1.stopReason, "end_turn");
+  assert.equal(r1.usage.inputTokens, 10);
+  assert.equal(text(agent.updates), "ANSWER:first");
+  assert.equal(text(agent.updates, "agent_thought_chunk"), "ZCode mode: Full access (plugin setting).\nthinking");
+  assert.ok(agent.updates.some((u) => u.sessionUpdate === "usage_update" && u.used === 10));
+  const tool = agent.updates.find((u) => u.sessionUpdate === "tool_call");
+  assert.equal(tool.kind, "read");
+  assert.equal(tool.status, "completed");
+  const send = calls().find((c) => c.startsWith("send "));
+  assert.match(send, /--model GLM-5.3 --effort low --mode full --allow-full/);
+  assert.ok(send.includes(`--folder ${cwd}`));
+  agent.updates.length = 0;
+  const r2 = await prompt(agent, s.sessionId, "second");
+  assert.equal(r2.stopReason, "end_turn");
+  assert.equal(text(agent.updates), "ANSWER:second");
+  assert.ok(calls().some((c) => c.startsWith("continue task_")));
+  agent.close();
+});
+
+test("a permission card becomes session/request_permission; allow runs approve, deny runs deny", async () => {
+  for (const [choice, call, answer] of [["allow", "approve", "APPROVED"], ["deny", "deny", "DENIED"]]) {
+    const { agent, cwd, calls } = setup();
+    agent.handlers.permission = (p) => {
+      assert.equal(p.toolCall.kind, "edit");
+      assert.deepEqual(p.options.map((o) => o.kind), ["allow_once", "reject_once"]);
+      return choice;
+    };
+    await agent.request("initialize", { protocolVersion: 1 });
+    const s = await agent.request("session/new", { cwd, mcpServers: [] });
+    const r = await prompt(agent, s.sessionId, "approve it");
+    assert.equal(r.stopReason, "end_turn");
+    assert.ok(calls().some((c) => c.startsWith(call + " task_")), call);
+    assert.equal(text(agent.updates), answer);
+    const final = agent.updates.filter((u) => u.sessionUpdate === "tool_call_update").at(-1);
+    assert.equal(final.status, choice === "allow" ? "completed" : "failed");
+    agent.close();
+  }
+});
+
+test("cancel stops the task and ends the turn with cancelled", async () => {
+  const { agent, cwd, calls } = setup();
+  await agent.request("initialize", { protocolVersion: 1 });
+  const s = await agent.request("session/new", { cwd, mcpServers: [] });
+  const p = prompt(agent, s.sessionId, "slow one");
+  await new Promise((r) => setTimeout(r, 1500));
+  agent.notify("session/cancel", { sessionId: s.sessionId });
+  const r = await p;
+  assert.equal(r.stopReason, "cancelled");
+  assert.ok(calls().some((c) => c.startsWith("cancel task_")));
+  agent.close();
+});
+
+test("a failed ZCode turn is a JSON-RPC error", async () => {
+  const { agent, cwd } = setup();
+  await agent.request("initialize", { protocolVersion: 1 });
+  const s = await agent.request("session/new", { cwd, mcpServers: [] });
+  await assert.rejects(prompt(agent, s.sessionId, "fail now"), /boom/);
+  agent.close();
+});
+
+function second(a, extraEnv = {}) {
+  return startAgent(process.execPath, [agentPath], { HOME: a.dir, ZCODE_ACP_BRIDGE: fakePath, FAKE_ZC_DIR: a.dir, FAKE_ZC_ROOT: fs.realpathSync(a.cwd), ZCODE_ACP_SESSIONS: path.join(a.dir, "sessions.json"), ...extraEnv });
+}
+
+test("with the limit at 1 a second chat waits for the first and is told so", async () => {
+  const env = { FAKE_ZC_MAX: "1" };
+  const a = setup(env);
+  const b = second(a, env);
+  for (const x of [a.agent, b]) await x.request("initialize", { protocolVersion: 1 });
+  const sa = await a.agent.request("session/new", { cwd: a.cwd, mcpServers: [] });
+  const sb = await b.request("session/new", { cwd: a.cwd, mcpServers: [] });
+  const pa = prompt(a.agent, sa.sessionId, "slow first");
+  await new Promise((r) => setTimeout(r, 1200));
+  const pb = prompt(b, sb.sessionId, "quick second");
+  await b.waitFor((u) => u.sessionUpdate === "agent_thought_chunk" && /waiting for one to finish/.test(u.content.text), 8000);
+  a.agent.notify("session/cancel", { sessionId: sa.sessionId });
+  assert.equal((await pa).stopReason, "cancelled");
+  assert.equal((await pb).stopReason, "end_turn");
+  assert.equal(text(b.updates), "ANSWER:quick");
+  a.agent.close();
+  b.close();
+});
+
+test("with the limit at 2 two chats run together, a third waits; continue and cancel of one do not disturb the others", async () => {
+  const env = { FAKE_ZC_MAX: "2" };
+  const a = setup(env);
+  const b = second(a, env);
+  const c = second(a, env);
+  try {
+    for (const x of [a.agent, b, c]) await x.request("initialize", { protocolVersion: 1 });
+    const [sa, sb, sc] = [await a.agent.request("session/new", { cwd: a.cwd, mcpServers: [] }), await b.request("session/new", { cwd: a.cwd, mcpServers: [] }), await c.request("session/new", { cwd: a.cwd, mcpServers: [] })];
+    const pa = prompt(a.agent, sa.sessionId, "slow alpha");
+    const pb = prompt(b, sb.sessionId, "slow beta");
+    const sends = () => fs.readdirSync(a.dir).filter((f) => /^task_.*\.json$/.test(f)).length; // tasks created (a refused send creates none)
+    for (let i = 0; i < 50 && sends() < 2; i++) await new Promise((r) => setTimeout(r, 100));
+    assert.equal(sends(), 2, "both started without waiting for each other");
+    const pc = prompt(c, sc.sessionId, "quick gamma");
+    await c.waitFor((u) => u.sessionUpdate === "agent_thought_chunk" && /limit 2/.test(u.content.text), 8000);
+    assert.equal(sends(), 2, "the third did not start");
+    a.agent.notify("session/cancel", { sessionId: sa.sessionId });
+    assert.equal((await pa).stopReason, "cancelled");
+    assert.equal((await pc).stopReason, "end_turn");
+    assert.equal(text(c.updates), "ANSWER:quick");
+    b.notify("session/cancel", { sessionId: sb.sessionId });
+    assert.equal((await pb).stopReason, "cancelled");
+  } finally {
+    for (const x of [a.agent, b, c]) x.close();
+  }
+});
+
+test("without a limit chats do not wait for each other", async () => {
+  const a = setup();
+  const b = second(a);
+  for (const x of [a.agent, b]) await x.request("initialize", { protocolVersion: 1 });
+  const sa = await a.agent.request("session/new", { cwd: a.cwd, mcpServers: [] });
+  const sb = await b.request("session/new", { cwd: a.cwd, mcpServers: [] });
+  const pa = prompt(a.agent, sa.sessionId, "slow first");
+  await new Promise((r) => setTimeout(r, 800));
+  const rb = await prompt(b, sb.sessionId, "quick second");
+  assert.equal(rb.stopReason, "end_turn");
+  assert.equal(b.updates.some((u) => u.sessionUpdate === "agent_thought_chunk" && /waiting/.test(u.content?.text || "")), false);
+  a.agent.notify("session/cancel", { sessionId: sa.sessionId });
+  assert.equal((await pa).stopReason, "cancelled");
+  a.agent.close();
+  b.close();
+});
+
+test("session/load restores the ZCode task so the next prompt is a continue", async () => {
+  const { agent, cwd, dir, calls } = setup();
+  await agent.request("initialize", { protocolVersion: 1 });
+  const s = await agent.request("session/new", { cwd, mcpServers: [] });
+  await prompt(agent, s.sessionId, "one");
+  agent.close();
+  const again = startAgent(process.execPath, [agentPath], { HOME: dir, ZCODE_ACP_BRIDGE: fakePath, FAKE_ZC_DIR: dir, FAKE_ZC_ROOT: fs.realpathSync(cwd), ZCODE_ACP_SESSIONS: path.join(dir, "sessions.json") });
+  await again.request("initialize", { protocolVersion: 1 });
+  await again.request("session/load", { sessionId: s.sessionId, cwd, mcpServers: [] });
+  const r = await prompt(again, s.sessionId, "two");
+  assert.equal(r.stopReason, "end_turn");
+  assert.equal(text(again.updates), "ANSWER:two");
+  assert.ok(calls().some((c) => c.startsWith("continue task_")));
+  again.close();
+});
+
+test("BB's <system_instructions> block is not forwarded to ZCode", async () => {
+  const { agent, cwd, dir } = setup();
+  await agent.request("initialize", { protocolVersion: 1 });
+  const s = await agent.request("session/new", { cwd, mcpServers: [] });
+  const r = await agent.request("session/prompt", { sessionId: s.sessionId, prompt: [{ type: "text", text: "<system_instructions>\nbb skills ...\n</system_instructions>" }, { type: "text", text: "real question" }] });
+  assert.equal(r.stopReason, "end_turn");
+  assert.equal(text(agent.updates), "ANSWER:real");
+  const sent = fs.readdirSync(dir).filter((f) => f.startsWith("task_")).map((f) => JSON.parse(fs.readFileSync(path.join(dir, f), "utf8")).turns[0].events[0].text);
+  assert.deepEqual(sent, ["real question"]);
+  agent.close();
+});
+
+test("text grows by deltas under one id, tools go in_progress -> completed with output (streaming)", async () => {
+  const { agent, cwd } = setup();
+  await agent.request("initialize", { protocolVersion: 1 });
+  const s = await agent.request("session/new", { cwd, mcpServers: [] });
+  const r = await prompt(agent, s.sessionId, "grow it");
+  assert.equal(r.stopReason, "end_turn");
+  const chunks = agent.updates.filter((u) => u.sessionUpdate === "agent_message_chunk").map((u) => u.content.text);
+  assert.deepEqual(chunks, ["AB", "CD", "EF"]);
+  assert.equal(new Set(agent.updates.filter((u) => u.sessionUpdate === "agent_message_chunk").map((u) => u.messageId)).size, 1);
+  const tool = agent.updates.filter((u) => u.toolCallId === "call_g");
+  assert.deepEqual(tool.map((u) => [u.sessionUpdate, u.status]), [["tool_call", "in_progress"], ["tool_call_update", "completed"]]);
+  assert.equal(tool[1].content[0].content.text, "hi");
+  assert.equal(tool[1].kind, "execute");
+  agent.close();
+});
+
+test("a continue turn does not replay the earlier turn's parts", async () => {
+  const { agent, cwd } = setup();
+  await agent.request("initialize", { protocolVersion: 1 });
+  const s = await agent.request("session/new", { cwd, mcpServers: [] });
+  await prompt(agent, s.sessionId, "grow one");
+  agent.updates.length = 0;
+  await prompt(agent, s.sessionId, "two");
+  assert.equal(text(agent.updates), "ANSWER:two");
+  assert.equal(agent.updates.filter((u) => u.toolCallId === "call_g").length, 0);
+  agent.close();
+});
+
+test("the permission request reuses the tool card that is already on screen", async () => {
+  const { agent, cwd } = setup();
+  agent.handlers.permission = (p) => {
+    assert.equal(p.toolCall.toolCallId, "call_1");
+    return "allow";
+  };
+  await agent.request("initialize", { protocolVersion: 1 });
+  const s = await agent.request("session/new", { cwd, mcpServers: [] });
+  await prompt(agent, s.sessionId, "approve it");
+  assert.equal(agent.updates.filter((u) => u.sessionUpdate === "tool_call" && u.toolCallId === "call_1").length, 1);
+  agent.close();
+});
+
+test("cancelling a pending permission request cancels the turn once", async () => {
+  const { agent, cwd, calls } = setup();
+  agent.handlers.permission = () => "cancel";
+  await agent.request("initialize", { protocolVersion: 1 });
+  const s = await agent.request("session/new", { cwd, mcpServers: [] });
+  const r = await prompt(agent, s.sessionId, "approve it");
+  assert.equal(r.stopReason, "cancelled");
+  assert.equal(calls().filter((c) => c.startsWith("cancel task_")).length, 1);
+  assert.equal(calls().filter((c) => c.startsWith("deny task_")).length, 0);
+  agent.close();
+});
+
+test("BB's MCP servers are merged into <cwd>/.zcode/config.json and removed again; the project's own entries stay", async () => {
+  const { agent, cwd, dir } = setup();
+  fs.mkdirSync(path.join(cwd, ".zcode"));
+  const file = path.join(cwd, ".zcode", "config.json");
+  fs.writeFileSync(file, JSON.stringify({ theme: "x", mcp: { servers: { mine: { type: "stdio", command: "own" }, "bb-keep": { type: "stdio", command: "project-owned" } } } }));
+  await agent.request("initialize", { protocolVersion: 1 });
+  const servers = [
+    { name: "bridge", command: "/usr/bin/node", args: ["a.js"], env: [{ name: "TOKEN", value: "t" }] },
+    { name: "keep", command: "ours" },
+    { type: "http", name: "web", url: "https://x.test/mcp", headers: [{ name: "Authorization", value: "Bearer z" }] },
+  ];
+  const s = await agent.request("session/new", { cwd, mcpServers: servers });
+  const cfg = JSON.parse(fs.readFileSync(file, "utf8"));
+  assert.equal(cfg.theme, "x");
+  assert.deepEqual(Object.keys(cfg.mcp.servers).sort(), ["bb-bridge", "bb-keep", "bb-web", "mine"]);
+  assert.deepEqual(cfg.mcp.servers["bb-bridge"], { type: "stdio", command: "/usr/bin/node", args: ["a.js"], env: { TOKEN: "t" } });
+  assert.deepEqual(cfg.mcp.servers["bb-web"], { type: "http", url: "https://x.test/mcp", headers: { Authorization: "Bearer z" } });
+  assert.equal(cfg.mcp.servers["bb-keep"].command, "project-owned");
+  await agent.request("session/close", { sessionId: s.sessionId });
+  const after = JSON.parse(fs.readFileSync(file, "utf8"));
+  assert.deepEqual(Object.keys(after.mcp.servers).sort(), ["bb-keep", "mine"]);
+  assert.equal(after.mcp.servers.mine.command, "own");
+  agent.close();
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(dir, ".zcode-bridge", "acp-mcp-injected.json"), "utf8")), {});
+});
+
+test("MCP: a project without .zcode gets one and loses it again when the process ends", async () => {
+  const { agent, cwd } = setup();
+  await agent.request("initialize", { protocolVersion: 1 });
+  await agent.request("session/new", { cwd, mcpServers: [{ name: "bridge", command: "x" }] });
+  assert.ok(fs.existsSync(path.join(cwd, ".zcode", "config.json")));
+  agent.child.kill("SIGTERM");
+  await new Promise((r) => agent.child.on("exit", r));
+  assert.equal(fs.existsSync(path.join(cwd, ".zcode")), false);
+});
+
+test("MCP: a registry entry of a dead process is swept by the next session", async () => {
+  const { agent, cwd, dir } = setup();
+  const stale = path.join(cwd, ".zcode", "config.json");
+  fs.mkdirSync(path.dirname(stale));
+  fs.writeFileSync(stale, JSON.stringify({ mcp: { servers: { "bb-old": { type: "stdio", command: "x" } } } }));
+  fs.mkdirSync(path.join(dir, ".zcode-bridge"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".zcode-bridge", "acp-mcp-injected.json"), JSON.stringify({ dead: { pid: 999999, file: stale, keys: ["bb-old"], createdFile: true, createdDir: true, at: 1 } }));
+  await agent.request("initialize", { protocolVersion: 1 });
+  const other = fs.mkdtempSync(path.join(os.tmpdir(), "zcode-acp-other-"));
+  await agent.request("session/new", { cwd: other, mcpServers: [{ name: "bridge", command: "x" }] });
+  assert.equal(fs.existsSync(path.join(cwd, ".zcode")), false);
+  agent.close();
+});
+
+test("MCP: tools whose inputSchema has no top-level type get type object (ZCode drops a whole server otherwise)", async () => {
+  const { agent, cwd } = setup();
+  await agent.request("initialize", { protocolVersion: 1 });
+  const tools = [
+    { name: "plain", inputSchema: { type: "object", properties: {} } },
+    { name: "either", inputSchema: { $schema: "x", oneOf: [{ type: "object", properties: { a: { type: "string" } } }, { type: "object", properties: { b: { type: "string" } } }] } },
+  ];
+  const s = await agent.request("session/new", { cwd, mcpServers: [{ name: "bb-bridge", command: "x", env: [{ name: "BB_ACP_DYNAMIC_TOOLS", value: JSON.stringify(tools) }, { name: "OTHER", value: "1" }] }] });
+  const env = JSON.parse(fs.readFileSync(path.join(cwd, ".zcode", "config.json"), "utf8")).mcp.servers["bb-bridge"].env;
+  const fixed = JSON.parse(env.BB_ACP_DYNAMIC_TOOLS);
+  assert.equal(fixed[0].inputSchema.type, "object");
+  assert.equal(fixed[1].inputSchema.type, "object");
+  assert.equal(fixed[1].inputSchema.oneOf.length, 2);
+  assert.equal(env.OTHER, "1");
+  await agent.request("session/close", { sessionId: s.sessionId });
+  agent.close();
+});

@@ -1,0 +1,14 @@
+#!/bin/sh
+# Launcher for the ZCode ACP agent: follows its own symlink (~/.agents/bin/zcode-acp) and finds node without the daemon's PATH.
+self=$0
+while [ -h "$self" ]; do
+  d=$(dirname "$self")
+  self=$(readlink "$self")
+  case $self in /*) ;; *) self=$d/$self ;; esac
+done
+here=$(cd "$(dirname "$self")" && pwd -P)
+for n in /opt/homebrew/bin/node /usr/local/bin/node "$(command -v node 2>/dev/null)"; do
+  [ -n "$n" ] && [ -x "$n" ] && exec "$n" "$here/zcode-acp.mjs" "$@"
+done
+echo "zcode-acp: node not found" >&2
+exit 127
