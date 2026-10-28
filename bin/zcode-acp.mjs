@@ -204,9 +204,35 @@ function writeJsonAtomic(file, value, mode) {
 function mcpKey(name) {
   return /^bb[-_]/i.test(name) ? name : `bb-${name}`;
 }
-// ZCode's MCP client rejects a whole server when one tool's inputSchema has no top-level `type: "object"`. BB's bridge advertises a few
-// tools (bb_file_gateway, bb_browser_session_import) as a bare `oneOf`, so the tool list BB hands the bridge in BB_ACP_DYNAMIC_TOOLS
-// gets `type: "object"` added where it is missing; every `oneOf` branch is an object already, so the schema means the same.
+// ZCode's MCP client rejects a whole server when one tool's inputSchema has no top-level `type: "object"`, and its own input validator
+// does not understand `oneOf`/`anyOf`: every call to such a tool fails with "Tool input failed inputSchema validation" and GLM ends up
+// sending `{}`. BB's bridge advertises a few tools (bb_file_gateway, bb_browser_session_import) as a bare `oneOf` of objects, so the tool
+// list BB hands the bridge in BB_ACP_DYNAMIC_TOOLS gets those unions flattened into one object: every branch's properties, the
+// discriminator (a `const` in every branch) as an `enum`, and only the fields every branch requires. BB still checks the call against
+// the original schema on its side.
+function flattenUnion(schema) {
+  const branches = Array.isArray(schema.oneOf) ? schema.oneOf : Array.isArray(schema.anyOf) ? schema.anyOf : null;
+  if (!branches || schema.properties || !branches.length || !branches.every((b) => b && typeof b === "object" && b.properties && typeof b.properties === "object")) {
+    return schema.type === "object" ? schema : { type: "object", ...schema };
+  }
+  const properties = {};
+  for (const b of branches) {
+    for (const [key, prop] of Object.entries(b.properties)) {
+      const values = branches.map((x) => x.properties[key]).filter(Boolean);
+      const consts = values.map((v) => ("const" in v ? [v.const] : Array.isArray(v.enum) ? v.enum : null));
+      if (values.length === branches.length && consts.every(Boolean)) {
+        const enumValues = [...new Set(consts.flat())];
+        const notes = branches.map((x) => x.description && `${[].concat(x.properties[key].const ?? x.properties[key].enum).join("|")}: ${x.description}`).filter(Boolean);
+        properties[key] = { type: typeof enumValues[0] === "number" ? "number" : "string", enum: enumValues, ...(notes.length ? { description: notes.join("; ") } : {}) };
+      } else if (!(key in properties)) {
+        properties[key] = prop;
+      }
+    }
+  }
+  const required = Object.keys(properties).filter((key) => branches.every((b) => Array.isArray(b.required) && b.required.includes(key)));
+  const { oneOf: _oneOf, anyOf: _anyOf, $schema: _schema, ...rest } = schema;
+  return { ...rest, type: "object", properties, ...(required.length ? { required } : {}) };
+}
 function fixDynamicTools(env) {
   const raw = env.BB_ACP_DYNAMIC_TOOLS;
   if (typeof raw !== "string") return env;
@@ -216,8 +242,10 @@ function fixDynamicTools(env) {
     let changed = false;
     for (const t of tools) {
       const schema = t && t.inputSchema;
-      if (schema && typeof schema === "object" && schema.type !== "object") {
-        t.inputSchema = { type: "object", ...schema };
+      if (!schema || typeof schema !== "object") continue;
+      const fixed = flattenUnion(schema);
+      if (fixed !== schema) {
+        t.inputSchema = fixed;
         changed = true;
       }
     }

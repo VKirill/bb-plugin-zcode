@@ -305,19 +305,34 @@ test("MCP: a registry entry of a dead process is swept by the next session", asy
   agent.close();
 });
 
-test("MCP: tools whose inputSchema has no top-level type get type object (ZCode drops a whole server otherwise)", async () => {
+test("MCP: oneOf tool schemas are flattened into one object (ZCode drops the server without type and cannot validate oneOf)", async () => {
   const { agent, cwd } = setup();
   await agent.request("initialize", { protocolVersion: 1 });
+  const gateway = {
+    $schema: "x",
+    oneOf: [
+      { type: "object", description: "List hosts", properties: { operation: { type: "string", const: "hosts" } }, required: ["operation"], additionalProperties: false },
+      { type: "object", description: "List a folder", properties: { operation: { type: "string", const: "list" }, hostId: { type: "string" }, path: { type: "string" } }, required: ["operation", "hostId", "path"], additionalProperties: false },
+    ],
+  };
   const tools = [
     { name: "plain", inputSchema: { type: "object", properties: {} } },
-    { name: "either", inputSchema: { $schema: "x", oneOf: [{ type: "object", properties: { a: { type: "string" } } }, { type: "object", properties: { b: { type: "string" } } }] } },
+    { name: "bb_file_gateway", inputSchema: gateway },
+    { name: "loose", inputSchema: { oneOf: [{ type: "string" }, { type: "number" }] } },
   ];
   const s = await agent.request("session/new", { cwd, mcpServers: [{ name: "bb-bridge", command: "x", env: [{ name: "BB_ACP_DYNAMIC_TOOLS", value: JSON.stringify(tools) }, { name: "OTHER", value: "1" }] }] });
   const env = JSON.parse(fs.readFileSync(path.join(cwd, ".zcode", "config.json"), "utf8")).mcp.servers["bb-bridge"].env;
   const fixed = JSON.parse(env.BB_ACP_DYNAMIC_TOOLS);
-  assert.equal(fixed[0].inputSchema.type, "object");
-  assert.equal(fixed[1].inputSchema.type, "object");
-  assert.equal(fixed[1].inputSchema.oneOf.length, 2);
+  assert.deepEqual(fixed[0].inputSchema, { type: "object", properties: {} });
+  const flat = fixed[1].inputSchema;
+  assert.equal(flat.type, "object");
+  assert.equal(flat.oneOf, undefined);
+  assert.deepEqual(flat.properties.operation.enum, ["hosts", "list"]);
+  assert.match(flat.properties.operation.description, /hosts: List hosts; list: List a folder/);
+  assert.deepEqual(Object.keys(flat.properties).sort(), ["hostId", "operation", "path"]);
+  assert.deepEqual(flat.required, ["operation"]);
+  assert.equal(fixed[2].inputSchema.type, "object"); // not a union of objects: only the type is added
+  assert.equal(fixed[2].inputSchema.oneOf.length, 2);
   assert.equal(env.OTHER, "1");
   await agent.request("session/close", { sessionId: s.sessionId });
   agent.close();
