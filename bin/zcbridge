@@ -29,7 +29,7 @@ DBP = os.path.join(HOME, ".zcode/cli/db/db.sqlite")
 IDXP = os.path.join(HOME, ".zcode/v2/tasks-index.sqlite")
 STATE = os.path.join(HOME, ".zcode-bridge")
 BUNDLE = "dev.zcode.app"
-VERSION = "0.4.0"
+VERSION = "0.4.4"
 FOREGROUND = False                      # --foreground: the old path (activate ZCode, paste with Cmd+V, press keys); default is background
 TRACE = []                              # menus (popup buttons) pressed in this run, for the ui_trace of a send/continue result
 TRACE_T0 = time.time()
@@ -833,9 +833,8 @@ def do_send(a):
             need_app(); guard(); to_workspace(); close_stray_popups()
             before = sessions()
             zc("pressup", "AXStaticText", "=New task", check=False); wait_for("AXTextArea", ""); time.sleep(0.8)
-            route, route_note = choose_route(a.route, a.model, tok) if a.route != "keep" else (current_route(), None)
-            to_workspace(); zc("pressup", "AXStaticText", "=New task", check=False); wait_for("AXTextArea", ""); time.sleep(0.8)
             proj = choose_workspace(a.folder and os.path.abspath(a.folder))
+            route, route_note = choose_route(a.route, a.model, tok) if a.route != "keep" else (current_route(), None)
             set_model(a.model, a.effort)
             set_mode(a.mode)
             T["setup"] = time.time()
@@ -1246,11 +1245,10 @@ def dialog_texts():
 
 
 def start_plan_state(d):
-    """Texts of the Start Plan row and the quota block in Settings > Model settings (read only; the Start Plan row is never pressed:
-    choosing it changes which plan pays for tasks)."""
+    """Texts of the Start Plan row and the quota block in Settings > Model settings (read only)."""
     lines = [l.split('v="', 1)[1].rsplit('"', 1)[0] for l in d.splitlines() if "AXStaticText" in l and 'v="' in l]
     sp = "Start Plan" in d
-    return dict(start_plan_listed=sp, start_plan_ready=(lambda m: m.group(1) == "Ready" if m else None)(re.search(r'AXButton d="Start Plan"[\s\S]{0,300}?AXImage d="(Ready|Not ready)"', d)),
+    return dict(start_plan_listed=sp, start_plan_ready=promo_ready(d),
                 balance=[t for t in lines if re.search(r"tokens remaining|Today.s balance|used$", t)])
 
 
@@ -1355,51 +1353,79 @@ def do_rewards(a):
 
 
 # ---------------------------------------------------------------- route (which plan pays: Z.ai plan or the Start Plan promo)
-SETTINGS = os.path.join(HOME, ".zcode/v2/setting.json")
-ROUTES = {"plan": ("individual-coding-plan", "Z.ai"), "promo": ("start-plan", "Start Plan")}
+ROUTES = {"plan": "Z.ai", "promo": "Start Plan"}
+
+
+def open_route_picker():
+    """Open the composer's model picker. Caller holds the UI lock and is on the workspace."""
+    model = composer_model()
+    if not model: raise BridgeError("ui_element_missing", "model picker not found")
+    press("AXPopUpButton", "=" + " ".join(model), wait=0.9)
+    wait_for("AXMenuItem", "Provider:")
+    return next((n for n, _ in menu_items() if n.startswith("Provider: ")), None)
 
 
 def current_route():
-    """ZCode's connection for the Z.ai family as stored in its setting.json (read only): 'plan' | 'promo' | other kind | None."""
-    try: k = ((json.load(open(SETTINGS)).get("providerFamilyConnectionSelections") or {}).get("zai") or {}).get("kind")
-    except Exception: return None
-    return next((r for r, (kind, _) in ROUTES.items() if kind == k), k)
+    """The composer's connection, which can differ from the default in setting.json. Caller holds the UI lock."""
+    try:
+        provider = open_route_picker()
+        return next((r for r, label in ROUTES.items() if provider == "Provider: " + label), None)
+    finally:
+        if popup_open(): esc(("AXPopUpButton", "GLM"))
 
 
 def promo_ready(d=None):
     """True when Settings > Model settings lists the Start Plan as Ready (claimed and valid), False for Not ready, None if unknown."""
     d = d if d is not None else dump(120)
-    m = re.search(r'AXButton d="Start Plan"[\s\S]{0,300}?AXImage d="(Ready|Not ready)"', d)
-    return None if not m else m.group(1) == "Ready"
+    lines = d.splitlines()
+    for i, line in enumerate(lines):
+        if 'AXButton d="Start Plan"' not in line: continue
+        indent = len(line) - len(line.lstrip())
+        for child in lines[i + 1:]:
+            if len(child) - len(child.lstrip()) <= indent: break
+            m = re.search(r'AXImage d="(Ready|Not ready)"', child)
+            if m: return m.group(1) == "Ready"
+    return None
 
 
 def read_promo_ready():
     """Open Settings > Model settings and read the Start Plan state. Caller holds the UI lock."""
     need_app(); to_workspace()
     press("AXButton", "=Settings", wait=1.5); press("AXButton", "=Model settings", wait=1.5)
-    try: return promo_ready(dump(120))
+    try:
+        for _ in range(10):
+            ready = promo_ready(dump(120))
+            if ready is not None: return ready
+            time.sleep(0.5)
+        return None
     finally:
         if exists("AXButton", "=Back to workspace"): press("AXButton", "=Back to workspace", wait=1.0)
 
 
 def set_route(route):
-    """Select the connection in Settings > Model settings with the provider rows ('Z.ai' = the plan, 'Start Plan' = the promo).
-    Pressing a row is ZCode's own way to choose the connection; it applies to the whole app, so the caller changes it only when no
-    other task is running. Verified by reading setting.json. Caller holds the UI lock."""
-    kind, label = ROUTES[route]
+    """Select and verify the connection through the composer's Provider submenu. Settings rows only show account details.
+    Caller holds the UI lock. Do not reset the draft with New task afterwards: it restores the default connection."""
+    label = ROUTES[route]
     if current_route() == route: return False
     need_app(); to_workspace()
-    press("AXButton", "=Settings", wait=1.5); press("AXButton", "=Model settings", wait=1.5)
+    if route == "promo":
+        ready = read_promo_ready()
+        if ready is False:
+            raise BridgeError("promo_not_ready", "the Start Plan is not Ready in ZCode (not claimed today, or expired)")
+        if ready is None:
+            raise BridgeError("promo_status_unknown", "could not read the Start Plan status in ZCode; retry after Model settings has loaded")
     try:
-        if route == "promo" and promo_ready(dump(120)) is not True:
-            raise BridgeError("promo_not_ready", "the Start Plan is not Ready in ZCode (not claimed today, or expired); the route stays on the plan")
-        press("AXButton", "=" + label, wait=1.5)
+        provider = open_route_picker()
+        if not provider: raise BridgeError("ui_element_missing", "Provider submenu not found")
+        press("AXMenuItem", "=" + provider, wait=0.8)
+        name = next((n for n, _ in menu_items() if n == label or n.startswith(label + " ")), None)
+        if not name: raise BridgeError("route_not_set", "connection %s is not offered in the Provider submenu" % label)
+        press("AXMenuItem", "=" + name, wait=1.0)
     finally:
-        if exists("AXButton", "=Back to workspace"): press("AXButton", "=Back to workspace", wait=1.0)
-    for _ in range(10):
-        if current_route() == route: return True
-        time.sleep(0.5)
-    raise BridgeError("route_not_set", "the connection did not change to %s (setting.json reads %s)" % (route, current_route()))
+        if popup_open(): esc(("AXPopUpButton", "GLM"))
+    actual = current_route()
+    if actual == route: return True
+    raise BridgeError("route_not_set", "the connection did not change to %s (composer reads %s)" % (route, actual))
 
 
 def choose_route(want, model, own=None):
@@ -1420,7 +1446,7 @@ def choose_route(want, model, own=None):
         if model != "flash": want = "plan"
         else:
             tm = time.gmtime(); in_window = tm.tm_hour >= 15 or tm.tm_hour < 1      # the promo tokens are for use 15:00-01:00 UTC
-            want = "promo" if in_window and promo_ready() else "plan"
+            want = "promo" if in_window and read_promo_ready() else "plan"
     if want == cur: return cur, None
     if [e for e in slots_live() if e.get("token") != own]:
         return cur, "route %s wanted but other ZCode tasks are running; staying on %s" % (want, cur)
@@ -1431,12 +1457,12 @@ def choose_route(want, model, own=None):
 
 
 def do_route(a):
-    if not a.set:
-        with ui_lock(): return dict(ok=True, route=current_route(), promo_ready=read_promo_ready())
     with ui_lock():
+        need_app(); to_workspace(); close_stray_popups()
+        if not a.set: return dict(ok=True, route=current_route(), promo_ready=read_promo_ready())
         if slots_live(): raise BridgeError("busy", "ZCode tasks are running; the connection is shared by the whole app, change it when they finish")
         changed = set_route(a.set)
-    return dict(ok=True, route=current_route(), changed=changed)
+        return dict(ok=True, route=current_route(), changed=changed)
 
 
 # ---------------------------------------------------------------- models (what this ZCode offers)

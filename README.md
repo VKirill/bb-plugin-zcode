@@ -89,7 +89,7 @@ Optional, not done by this project: you can put your own MCP gateway into `~/.zc
 
 ZCode's server sometimes offers a claimable promo ("Start Plan": free GLM-5.3-Flash tokens each day) as a banner at the bottom left of the sidebar. `zcbridge rewards [--claim]` reports it or presses its action button through accessibility (the Rewards page in the account menu is the referral program and has no claim button). `zcbridge rewards --scheduled` is for launchd (`install.sh --rewards-job`): it acts from 10:59 UTC every minute until 12:00, then every 10 minutes until 15:00, stops after a success, and logs every attempt to `~/.zcode-bridge/rewards-attempts.log`. The schedule is the one announced for the promo I use; adapt `claim_schedule_due` in `bin/zcbridge` to yours.
 
-Which plan pays for a task is ZCode's *connection* (Z.ai plan or Start Plan), one choice for the whole app. `zcbridge route` shows it, `zcbridge route --set plan|promo` changes it through ZCode's Settings (refused unless the Start Plan is Ready and no other task runs). The plugin setting **Plan that pays**: Keep (default), Auto (promo for GLM-5.3-Flash while Ready and inside 15:00-01:00 UTC, else the plan), Always plan, Always promo. `zcbridge usage` has per-provider daily totals (input, cache read, fresh input, output) to compare.
+Which plan pays for a task is ZCode's *connection* (Z.ai plan or Start Plan), selected in the composer's model menu under **Provider**. `zcbridge route` reads that selection, and `zcbridge route --set plan|promo` changes it (refused unless the Start Plan is Ready and no other task runs). Settings > Model settings shows account details; its provider rows do not select the connection. A new draft can restore the default connection, so the bridge selects the route after choosing the task's workspace. The plugin setting **Plan that pays**: Keep (default), Auto (promo for GLM-5.3-Flash while Ready and inside 15:00-01:00 UTC, else the plan), Always plan, Always promo. The **GLM-5.3-Flash · Free** model uses only Start Plan and refuses to start if its status is unavailable or unreadable. `zcbridge usage` has per-provider daily totals (input, cache read, fresh input, output) to compare.
 
 ### Usage in BB
 
@@ -156,5 +156,7 @@ Apache-2.0, see [LICENSE](LICENSE). ZCode and Z.ai are trademarks of their owner
 **Ограничения:** это управление через интерфейс, обновление ZCode может сломать шаг; нужен разблокированный экран и не спящий Mac; каждая задача ZCode стоит около 40k входных токенов; ответ приходит по шагам модели, а не по токенам.
 
 **Ежедневные токены:** `zcbridge rewards --claim` нажимает баннер получения (если он выдан сервером), `install.sh --rewards-job` ставит задание launchd; `zcbridge route --set promo` переключает тариф на промо Start Plan. Подробности выше.
+
+**Выбор тарифа:** подключение выбирается в меню модели → Provider → Start Plan Free; строка Start Plan в настройках показывает сведения о тарифе. Мост проверяет выбор в композере после выбора папки задачи. Модель **GLM-5.3-Flash · Free** запускается только на стартовом тарифе; если статус не удалось прочитать, это отдельная ошибка, а не сообщение об отсутствии токенов.
 
 Лицензия: Apache-2.0.

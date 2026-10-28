@@ -1,6 +1,6 @@
 {
   "name": "bb-plugin-zcode",
-  "version": "0.4.3",
+  "version": "0.4.4",
   "description": "ZCode as a BB provider: chats that run on the ZCode desktop app (GLM-5.3 / GLM-5.3-Flash) on your Mac, driven through an accessibility bridge.",
   "keywords": [
     "bb-plugin",
