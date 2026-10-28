@@ -384,7 +384,24 @@ def tool_calls(sid):
 # ---------------------------------------------------------------- UI navigation
 def need_app():
     zc("frontmost", check=False)
-    zc("count", "AXButton", "Send")  # raises not_running / no_window
+    try:
+        zc("count", "AXButton", "Send")  # raises not_running / no_window
+    except BridgeError as e:
+        if e.code != "no_window": raise
+        # The window was closed (red button / Cmd+W) while ZCode keeps running: a reopen event makes it create the window again.
+        # It brings ZCode to the front, which beats failing every task and every claim until someone opens the window by hand.
+        before = frontmost()
+        subprocess.run(["osascript", "-e", 'tell application id "%s" to reopen' % BUNDLE], capture_output=True, timeout=10)
+        end = time.time() + 8
+        while time.time() < end:
+            time.sleep(0.5)
+            try: zc("count", "AXButton", "Send"); break
+            except BridgeError as e2:
+                if e2.code != "no_window": raise
+        else:
+            raise
+        log("need_app: ZCode had no window; reopened it")
+        if before and before != BUNDLE: subprocess.run(["open", "-b", before], capture_output=True, timeout=10)
     d = dump()
     if re.search(r"session has expired|Sign in again", d):
         raise BridgeError("session_expired", "ZCode shows 'session expired / Sign in again': the owner must sign in inside the app")
@@ -1201,12 +1218,13 @@ REWARDS_FILE = os.path.join(STATE, "rewards.json")
 
 
 def sidebar_banner_buttons(d):
-    """Buttons ZCode shows between the Tasks list and the account footer of the sidebar. The claim-token banner (campaign picture
-    inside a button, plus its close button) is the only thing placed there; empty when no campaign is delivered."""
+    """Buttons ZCode shows between the Tasks list and the account button of the sidebar. The claim-token banner (campaign picture
+    inside a button, plus its close button) is the only thing placed there; empty when no campaign is delivered. Older builds put
+    the banner above the footer, newer ones (2026-10) inside it, before the account button, as buttons "Open" and "Close"."""
     lines = d.splitlines(); start = end = None
     for i, l in enumerate(lines):
         if start is None and 'AXGroup/AXLandmarkRegion d="Tasks"' in l: start = i
-        elif start is not None and "AXGroup/AXSectionFooter" in l: end = i; break
+        elif start is not None and "AXPopUpButton" in l: end = i; break
     if start is None or end is None: return []
     out = []
     for l in lines[start + 1:end]:
