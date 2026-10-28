@@ -31,7 +31,7 @@ test("initialize, session/new advertises models and reasoning, set_config_option
   assert.equal(init.agentCapabilities.loadSession, true);
   const s = await agent.request("session/new", { cwd: "/tmp", mcpServers: [] });
   const model = s.configOptions.find((o) => o.category === "model");
-  assert.deepEqual(model.options.map((o) => o.name), ["GLM-5.3-Flash", "GLM-5.3"]);
+  assert.deepEqual(model.options.map((o) => o.name), ["GLM-5.3-Flash", "GLM-5.3-Flash · Free", "GLM-5.3"]);
   assert.equal(model.currentValue, "glm-5.3-flash");
   assert.deepEqual(s.configOptions.find((o) => o.category === "thought_level").options.map((o) => o.value), ["low", "high", "max"]);
   const r = await agent.request("session/set_config_option", { sessionId: s.sessionId, configId: "effort", value: "max" });
@@ -64,6 +64,20 @@ test("first turn uses send with model and effort, second turn uses continue, onl
   assert.equal(text(agent.updates), "ANSWER:second");
   assert.ok(calls().some((c) => c.startsWith("continue task_")));
   agent.close();
+});
+
+test("the Flash model is offered twice: the plain one runs on the plan, the «· Free» one only on the Start Plan", async () => {
+  for (const [value, route] of [["glm-5.3-flash", "plan"], ["glm-5.3-flash-free", "free"]]) {
+    const { agent, cwd, calls } = setup();
+    await agent.request("initialize", { protocolVersion: 1 });
+    const s = await agent.request("session/new", { cwd, mcpServers: [] });
+    await agent.request("session/set_config_option", { sessionId: s.sessionId, configId: "model", value });
+    await prompt(agent, s.sessionId, "hello");
+    const send = calls().find((c) => c.startsWith("send "));
+    assert.match(send, /--model GLM-5.3-Flash /);
+    assert.match(send, new RegExp(`--route ${route}(\\s|$)`));
+    agent.close();
+  }
 });
 
 test("a permission card becomes session/request_permission; allow runs approve, deny runs deny", async () => {

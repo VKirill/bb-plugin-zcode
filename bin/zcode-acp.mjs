@@ -18,7 +18,9 @@
 //   ZCODE_ACP_AUTO_SCOPE     project|all: what Autonomous mode answers "Allow once" to on its own (default project = file edits
 //                            inside the chat folder; everything else is put to BB as before). "Always allow" is never pressed.
 //   ZCODE_ACP_MODEL          model override (a ZCode model name); empty = ZCode's own default model
-//   ZCODE_ROUTE              keep|auto|plan|promo: which plan pays for a task (see `zcbridge route`)
+//   ZCODE_ROUTE              keep|auto|plan|promo: which plan pays for a task of a model without its own route (see `zcbridge route`)
+//   Free models              every Flash model is offered twice: «GLM-5.3-Flash» runs on the owner's Z.ai plan, «GLM-5.3-Flash · Free»
+//                            (id <model>-free) on the Start Plan's free tokens or not at all (`zcbridge send --route free`)
 //   ZCODE_ACP_REMOVE_PREFIXES  folders (colon or newline separated, ~ allowed) whose auto-registered projects are removed from ZCode's
 //                            list when the session ends (default ~/.lane-pilot/worktrees)
 //   ZCODE_ACP_AUTOADD=0      do not register unknown folders as ZCode projects
@@ -63,12 +65,21 @@ function loadModels() {
     cache = JSON.parse(fs.readFileSync(MODELS_FILE, "utf8"));
   } catch {}
   const list = (cache?.models || []).filter((m) => m.enabled).map((m) => ({ value: slug(m.name), name: m.name, bridge: m.name }));
-  const models = list.length ? list : FALLBACK_MODELS;
+  const models = withFreeTwins(list.length ? list : FALLBACK_MODELS);
   const wanted = MODEL_OVERRIDE && models.find((m) => m.name.toLowerCase() === MODEL_OVERRIDE.toLowerCase() || m.value === slug(MODEL_OVERRIDE));
   const own = cache?.default && models.find((m) => m.name === cache.default);
   return { models, defaultModel: (wanted || own || models[0]).value, stale: !cache || Date.now() - (cache.at || 0) * 1000 > MODELS_MAX_AGE_MS };
 }
-let MODELS = FALLBACK_MODELS;
+// The Start Plan's free tokens are for Flash: each Flash model gets a «· Free» twin that runs only on them, and the plain one runs on the plan,
+// so the model picked in BB says who pays. Other models follow ZCODE_ROUTE.
+function withFreeTwins(models) {
+  return models.flatMap((m) =>
+    /flash/i.test(m.name) && !m.route
+      ? [{ ...m, route: "plan" }, { value: `${m.value}-free`, name: `${m.name} · Free`, bridge: m.bridge, route: "free" }]
+      : [m],
+  );
+}
+let MODELS = withFreeTwins(FALLBACK_MODELS);
 let DEFAULT_MODEL = FALLBACK_MODELS[0].value;
 function refreshModelList() {
   const m = loadModels();
@@ -739,7 +750,8 @@ async function runPrompt(s, params) {
       const model = MODELS.find((m) => m.value === s.model) || MODELS[0];
       s.usedModel = model.value;
       const args = ["send", "--folder", s.cwd, "--prompt-file", "<file>", "--model", model.bridge, "--effort", s.effort, ...modeArgs(eff.mode)];
-      if (ROUTE !== "keep") args.push("--route", ROUTE);
+      const route = model.route || ROUTE;
+      if (route !== "keep") args.push("--route", route);
       if (!AUTOADD) args.push("--no-create-project");
       const res = await withPromptFile(text, (file) => runBridgeQueued(s, args.map((a) => (a === "<file>" ? file : a))));
       if (!res.ok) throw bridgeError(res);

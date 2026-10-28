@@ -157,6 +157,6 @@ test("the models BB offers are the ones ZCode offers (enabled ones from its mode
   await d.agent.request("initialize", { protocolVersion: 1 });
   const s = await d.agent.request("session/new", { cwd: d.cwd, mcpServers: [] });
   const model = s.configOptions.find((o) => o.category === "model");
-  assert.deepEqual(model.options.map((o) => o.name), ["GLM-5.3-Flash"]);
+  assert.deepEqual(model.options.map((o) => o.name), ["GLM-5.3-Flash", "GLM-5.3-Flash · Free"]);
   d.agent.close();
 });
