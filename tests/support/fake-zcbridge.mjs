@@ -61,7 +61,7 @@ if (cmd === "watch") {
     all.forEach((e, i) => { if (!sent.has(i) && (e.tick || 0) <= polls) { sent.add(i); const { tick: _t, delta: _d, ...ev } = e; console.log(JSON.stringify(ev)); } });
     const tu = d.turns.at(-1); let state = d.cancelled ? "cancelled" : tu.state;
     if (sent.size < all.length && state === "completed") state = "running";
-    if (["completed", "error", "cancelled", "waiting_approval"].includes(state) || Date.now() > end) { console.log(JSON.stringify({ event: "state", state })); process.exit(0); }
+    if (["completed", "error", "cancelled", "waiting_approval"].includes(state) || Date.now() > end) { console.log(JSON.stringify({ event: "state", state, pending_approvals: tu.pending ? [tu.pending] : [], tokens: { input: 10, output: 2, reasoning: 1, cache_read: 0 }, error: state === "error" ? "boom" : null })); process.exit(0); }
     setTimeout(tick, 100);
   };
   tick();

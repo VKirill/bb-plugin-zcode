@@ -34,7 +34,7 @@ import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
 
-const VERSION = "0.4.0";
+const VERSION = "0.5.0";
 const HOME = os.homedir();
 const STATE_DIR = path.join(HOME, ".zcode-bridge");
 const BRIDGE = process.env.ZCODE_ACP_BRIDGE || [path.join(path.dirname(fs.realpathSync(process.argv[1] || ".")), "zcbridge"), path.join(HOME, ".local", "bin", "zcbridge"), path.join(HOME, ".agents", "bin", "zcbridge")].find((f) => fs.existsSync(f)) || "zcbridge";
@@ -87,7 +87,7 @@ function refreshModelList() {
   DEFAULT_MODEL = m.defaultModel;
   if (m.stale && !refreshModelList.running) {
     refreshModelList.running = true;
-    runBridge(["models"], { timeoutMs: 120000 })
+    runBridge(["models", "--if-stale"], { timeoutMs: 120000 })
       .then((r) => {
         if (r.ok) {
           const n = loadModels();
@@ -393,7 +393,7 @@ async function endSession(s) {
     const r = await runBridge(["project-remove", s.cwd], { timeoutMs: 120000 });
     if (!r.ok) log("project-remove failed:", JSON.stringify(r.error));
   }
-  if (s.usedPlan || (s.usedModel && s.usedModel !== DEFAULT_MODEL)) restoreComposer(s);
+  if (s.usedPlan || s.usedModel) restoreComposer(s);
   await resetChain;
 }
 function endSessionMcp(s) {
@@ -545,8 +545,8 @@ function toolCallUpdate(id, tool, input, status, output, error) {
 class Turn {
   constructor(s) {
     this.s = s;
-    this.text = new Map(); // text/reasoning part id -> text already sent (survives watch restarts)
-    this.tools = new Map(); // tool call id -> last status sent
+    this.text = s.seenText ?? new Map(); // retained across turns and approval restarts
+    this.tools = s.seenTools ?? new Map();
     this.emitted = false;
     this.child = null;
   }
@@ -554,7 +554,9 @@ class Turn {
   // watch lists the task from the start on every run, so the maps above decide what is new.
   watchOnce(onEvent) {
     return new Promise((resolve, reject) => {
-      const child = spawn(BRIDGE, ["watch", this.s.taskId, "--poll", "0.7", "--timeout", String(TURN_TIMEOUT_S)], { env: bridgeEnv(), stdio: ["ignore", "pipe", "pipe"] });
+      const args = ["watch", this.s.taskId, "--poll", "0.7", "--timeout", String(TURN_TIMEOUT_S)];
+      if (this.s.watchCursor) args.push("--since", String(this.s.watchCursor));
+      const child = spawn(BRIDGE, args, { env: bridgeEnv(), stdio: ["ignore", "pipe", "pipe"] });
       this.child = child;
       let final = null;
       let err = "";
@@ -566,7 +568,11 @@ class Turn {
         } catch {
           return;
         }
-        if (ev.event === "state") final = ev;
+        if (ev.event === "state") {
+          final = ev;
+          this.lastState = ev;
+          if (ev.cursor) this.s.watchCursor = ev.cursor;
+        }
         else onEvent(ev);
       });
       child.on("error", reject);
@@ -579,7 +585,8 @@ class Turn {
     });
   }
   async baseline() {
-    // Mark everything already in the task (earlier turns) as sent.
+    if (this.s.seenText) return;
+    // A loaded session has no in-memory fingerprints; prime them once.
     await this.watchOnce((ev) => this.handle(ev, true));
   }
   handle(ev, silent = false) {
@@ -659,8 +666,8 @@ class Turn {
       const final = await this.watchOnce((ev) => this.handle(ev));
       if (final.state !== "waiting_approval") return final.state;
       if (this.s.cancelled) return "cancelled";
-      const ap = await runBridge(["approvals", this.s.taskId]);
-      const card = ap.ok && ap.pending && ap.pending[0];
+      const ap = final.pending_approvals ? null : await runBridge(["approvals", this.s.taskId]);
+      const card = final.pending_approvals?.[0] ?? (ap?.ok && ap.pending?.[0]);
       if (!card) {
         await new Promise((r) => setTimeout(r, 1000));
         continue;
@@ -710,18 +717,23 @@ function inProjectEdit(card, root) {
 // After a session ran in Plan mode, ZCode's composer for that task keeps the Plan chip: take it off again and leave the task on the
 // resting mode. A model other than ZCode's own default is also put back on the New task composer (ZCode remembers the last one used).
 function restoreComposer(s) {
+  const plan = s.usedPlan;
+  const model = s.usedModel;
+  s.usedPlan = false;
+  s.usedModel = null;
   const doReset = async () => {
-    if (s.usedPlan && s.taskId) {
+    if (plan && s.taskId) {
       const rest = MODE_DEFAULT === "plan" ? "ask" : MODE_DEFAULT;
       const r = await runBridge(["mode-reset", "--task", s.taskId, "--to", rest], { timeoutMs: 120000 });
       if (!r.ok) log("mode reset failed:", JSON.stringify(r.error));
-      s.usedPlan = false;
+      if (!r.ok) s.usedPlan = true;
     }
-    if (s.usedModel && s.usedModel !== DEFAULT_MODEL) {
+    if (model) {
       const m = MODELS.find((x) => x.value === DEFAULT_MODEL);
-      if (m) {
+      if (m && model !== m.bridge) {
         const r = await runBridge(["mode-reset", "--to", "none", "--model", m.bridge], { timeoutMs: 120000 });
         if (!r.ok) log("model reset failed:", JSON.stringify(r.error));
+        if (!r.ok) s.usedModel = model;
       }
     }
   };
@@ -740,6 +752,8 @@ async function runPrompt(s, params) {
   s.active = new Turn(s);
   const turn = s.active;
   try {
+    await resetChain;
+    if (s.cancelled) return { stopReason: "cancelled" };
     const eff = effectiveMode();
     if (!s.announced) {
       s.announced = true;
@@ -748,7 +762,7 @@ async function runPrompt(s, params) {
     s.usedPlan = s.usedPlan || eff.mode === "plan";
     if (!s.taskId) {
       const model = MODELS.find((m) => m.value === s.model) || MODELS[0];
-      s.usedModel = model.value;
+      s.usedModel = model.bridge;
       const args = ["send", "--folder", s.cwd, "--prompt-file", "<file>", "--model", model.bridge, "--effort", s.effort, ...modeArgs(eff.mode)];
       const route = model.route || ROUTE;
       if (route !== "keep") args.push("--route", route);
@@ -773,7 +787,7 @@ async function runPrompt(s, params) {
       return { stopReason: "cancelled" };
     }
     const state = await turn.stream();
-    const status = await runBridge(["status", s.taskId]);
+    const status = turn.lastState && Object.hasOwn(turn.lastState, "tokens") ? { ok: true, ...turn.lastState } : await runBridge(["status", s.taskId]);
     const tok = status.ok && status.tokens ? status.tokens : null;
     if (tok) update(s.id, { sessionUpdate: "usage_update", used: tok.input ?? 0, size: 1000000, _meta: { zcode: { inputTokens: tok.input ?? 0, cacheReadTokens: tok.cache_read ?? 0, freshInputTokens: Math.max(0, (tok.input ?? 0) - (tok.cache_read ?? 0)), outputTokens: tok.output ?? 0, reasoningTokens: tok.reasoning ?? 0, taskId: s.taskId } } });
     const usage = tok ? { inputTokens: tok.input ?? 0, outputTokens: tok.output ?? 0, thoughtTokens: tok.reasoning ?? 0, cachedReadTokens: tok.cache_read ?? 0, totalTokens: (tok.input ?? 0) + (tok.output ?? 0) } : undefined;
@@ -791,8 +805,10 @@ async function runPrompt(s, params) {
     if (e instanceof AcpError && e.code === -32800) return { stopReason: "cancelled" };
     throw e;
   } finally {
+    s.seenText = turn.text;
+    s.seenTools = turn.tools;
     s.active = null;
-    if (s.usedPlan || (s.usedModel && s.usedModel !== DEFAULT_MODEL)) restoreComposer(s);
+    if (s.usedPlan || s.usedModel) restoreComposer(s);
   }
 }
 

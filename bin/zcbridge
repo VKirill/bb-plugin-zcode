@@ -29,7 +29,7 @@ DBP = os.path.join(HOME, ".zcode/cli/db/db.sqlite")
 IDXP = os.path.join(HOME, ".zcode/v2/tasks-index.sqlite")
 STATE = os.path.join(HOME, ".zcode-bridge")
 BUNDLE = "dev.zcode.app"
-VERSION = "0.4.4"
+VERSION = "0.5.0"
 FOREGROUND = False                      # --foreground: the old path (activate ZCode, paste with Cmd+V, press keys); default is background
 TRACE = []                              # menus (popup buttons) pressed in this run, for the ui_trace of a send/continue result
 TRACE_T0 = time.time()
@@ -131,18 +131,19 @@ def keys(script):
 
 
 def popup_open():
-    return exists("AXMenu", "") or exists("AXSlider", "Effort")
+    return composer_snapshot().get("menu_open", False)
 
 
 def esc(trigger=None):
-    """Close the open popup. Foreground: Escape. Background: press the popup's trigger again (Radix toggles); trigger = (role, label[, nth])."""
     if FOREGROUND:
-        keys("key code 53"); time.sleep(0.5); return
-    for _ in range(3):
-        if not popup_open() or not trigger: return
-        n = len(TRACE)
-        zc("press", trigger[0], trigger[1], nth=trigger[2] if len(trigger) > 2 else 0, check=False); time.sleep(0.7)
-        del TRACE[n:]    # this press closes a menu: it is not an opening
+        keys("key code 53"); return
+    if not trigger: return
+    state = composer_snapshot()
+    if not state.get("menu_open"): return
+    n = len(TRACE)
+    zc("press", trigger[0], trigger[1], nth=trigger[2] if len(trigger) > 2 else 0, check=False)
+    del TRACE[n:]
+    wait_snapshot(lambda s: not s.get("menu_open"))
 
 
 PASTE_CHUNK = 8000   # ZCode turns ONE paste of 15360+ characters into a "Pasted text" attachment, so long prompts go in as several pastes below that
@@ -177,9 +178,21 @@ def paste(text, probe=None, target=("AXTextArea", "")):
     if not FOREGROUND:
         for attempt in range(2):
             for i, piece in enumerate(pieces):
+                started = time.monotonic()
                 r = zc("bgpaste", target[0], target[1], piece if i < len(pieces) - 1 else piece.rstrip(), check=False, timeout=90)
-                if not r.startswith("OK"): log("bgpaste failed (chunk %d/%d): %s" % (i + 1, len(pieces), r.strip())); break
-                log("bgpaste %d/%d %s" % (i + 1, len(pieces), r.strip()))
+                elapsed = int((time.monotonic() - started) * 1000)
+                if not r.startswith("OK"):
+                    log("bgpaste failed (chunk %d/%d attempt %d, %dms): %s" % (i + 1, len(pieces), attempt + 1, elapsed, r.strip()))
+                    if "text-not-visible" in r:
+                        # The renderer can replace the AX editor or finish its queued paste just after the deadline.
+                        observed = zc("textlen", target[0], target[1], check=False)
+                        match = re.search(r"len=(\d+).*tail=(.*)", observed)
+                        prefix = "".join(pieces[:i + 1]).rstrip()
+                        probe = piece.rstrip()[-24:].replace("\n", "\\n")
+                        if match and int(match.group(1)) >= u16(prefix) - 2 and match.group(2).strip().endswith(probe):
+                            log("bgpaste recovered delayed chunk %d/%d without clearing" % (i + 1, len(pieces))); continue
+                    break
+                log("bgpaste %d/%d attempt=%d total=%dms %s" % (i + 1, len(pieces), attempt + 1, elapsed, r.strip()))
             else: return True
             zc("bgclear", target[0], target[1], check=False, timeout=60)
         return False
@@ -208,7 +221,7 @@ def press(role, q, nth=0, allow=False, wait=0.8):
 
 
 def exists(role, q):
-    return zc("count", role, q, check=False).strip() not in ("", "0")
+    return zc("exists", role, q, check=False).strip() == "1"
 
 
 def wait_for(role, q, timeout=8.0):
@@ -270,9 +283,15 @@ def ui_lock(timeout=None):
 
 
 # ---------------------------------------------------------------- stores (read-only)
+CONNECTIONS = {}
+
+
 def conn(path):
-    if not os.path.exists(path): raise BridgeError("store_missing", "%s not found" % path)
-    c = sqlite3.connect("file:%s?mode=ro" % path, uri=True, timeout=10); c.row_factory = sqlite3.Row; return c
+    if path not in CONNECTIONS:
+        if not os.path.exists(path): raise BridgeError("store_missing", "%s not found" % path)
+        c = sqlite3.connect("file:%s?mode=ro" % path, uri=True, timeout=10, isolation_level=None)
+        c.row_factory = sqlite3.Row; CONNECTIONS[path] = c
+    return CONNECTIONS[path]
 
 
 def projects():
@@ -306,12 +325,7 @@ def session_row(sid):
 
 
 def user_messages(c, sid):
-    res = []
-    for r in c.execute("select id,time_created,data from message where session_id=? order by time_created", (sid,)):
-        j = json.loads(r["data"])
-        if j.get("role") == "user" and (j.get("metadata") or {}).get("visibility") != "model-only":
-            res.append((r["id"], r["time_created"]))
-    return res
+    return [(r["id"], r["time_created"]) for r in c.execute("select id,time_created from message where session_id=? and json_extract(data,'$.role')='user' and coalesce(json_extract(data,'$.metadata.visibility'),'')!='model-only' order by time_created", (sid,))]
 
 
 def pending(sid):
@@ -349,17 +363,16 @@ def task_state(sid):
     return out
 
 
-def parts(sid, since=0):
-    """Ordered parts of a task: [{message_id, role, type, ...}] sorted by message time then part sequence."""
-    c = conn(DBP); res = []
-    msgs = {r["id"]: (r["time_created"], json.loads(r["data"])) for r in c.execute("select id,time_created,data from message where session_id=?", (sid,))}
-    for r in c.execute("select id,message_id,sequence,time_created,data from part where session_id=?", (sid,)):
-        mt, md = msgs.get(r["message_id"], (0, {}))
-        if (md.get("metadata") or {}).get("visibility") == "model-only": continue
-        j = json.loads(r["data"])
-        res.append((mt, r["sequence"] or 0, r["id"], md.get("role"), j))
-    res.sort(key=lambda x: (x[0], x[1]))
-    return res
+def parts(sid, since=0, cursor=None):
+    """Changed parts in message/part order. Updated timestamps include edits to existing parts."""
+    rows = conn(DBP).execute("""select p.id,p.sequence,p.data,coalesce(p.time_updated,p.time_created) updated,
+        m.time_created mt,json_extract(m.data,'$.role') role from part p join message m on m.id=p.message_id
+        where p.session_id=? and coalesce(p.time_updated,p.time_created)>=?
+        and coalesce(json_extract(m.data,'$.metadata.visibility'),'')!='model-only'
+        order by m.time_created,p.sequence,p.id""", (sid, since)).fetchall()
+    if cursor is not None and rows:
+        cursor["since"] = max(since, max(r["updated"] or 0 for r in rows) - 1000)
+    return [(r["mt"], r["sequence"] or 0, r["id"], r["role"], json.loads(r["data"])) for r in rows]
 
 
 def final_answer(sid):
@@ -385,7 +398,7 @@ def tool_calls(sid):
 def need_app():
     zc("frontmost", check=False)
     try:
-        zc("count", "AXButton", "Send")  # raises not_running / no_window
+        zc("exists", "AXButton", "Send")  # raises not_running / no_window
     except BridgeError as e:
         if e.code != "no_window": raise
         # The window was closed (red button / Cmd+W) while ZCode keeps running: a reopen event makes it create the window again.
@@ -395,7 +408,7 @@ def need_app():
         end = time.time() + 8
         while time.time() < end:
             time.sleep(0.5)
-            try: zc("count", "AXButton", "Send"); break
+            try: zc("exists", "AXButton", "Send"); break
             except BridgeError as e2:
                 if e2.code != "no_window": raise
         else:
@@ -409,12 +422,13 @@ def need_app():
 
 
 def to_workspace():
-    for _ in range(3):
-        if exists("AXButton", "=Back to workspace"): press("AXButton", "=Back to workspace", wait=1.2)
-        if exists("AXButton", "=Create scheduled task") or exists("AXHeading", "Plugin Marketplace"):
-            zc("pressup", "AXStaticText", "=New task", check=False); time.sleep(1.0)
-        if exists("AXTextArea", ""): return
-        time.sleep(0.6)
+    state = composer_snapshot()
+    if state.get("back"):
+        press("AXButton", "=Back to workspace", wait=0)
+        state = wait_snapshot(lambda s: s.get("workspace") and not s.get("back"))
+    if not state.get("workspace"):
+        zc("pressup", "AXStaticText", "=New task", check=False)
+        wait_snapshot(lambda s: s.get("workspace"))
 
 
 def close_stray_popups():
@@ -508,43 +522,9 @@ def composer_model():
 
 
 def set_model(model, effort, _again=False):
-    """Change only what differs, with at most one menu opening: the chip is read first; when model or effort differs the picker is
-    opened once, the effort slider is moved while it is open, then the model item is picked (which closes it), and the result is
-    verified from the chip. Returns True when something was changed."""
-    lab = MODELS.get(model, model)
-    cur = composer_model()
-    if cur and cur[0].lower() == lab.lower() and (not effort or cur[1].lower() == effort): return False   # the chip already reads what was asked
-    pop = next((first(l) for l in zc("find", "AXPopUpButton", "", check=False).splitlines() if re.search(r"GLM|\b(Low|High|Max)\b", l) and "Switch mode" not in l), None)
-    if not pop: raise BridgeError("ui_element_missing", "model picker not found")
-    press("AXPopUpButton", pop, wait=0.9)
-    names = [i[0] for i in menu_items()]
-    if not any(re.match(re.escape(lab) + r"(\s|$)", n) for n in names):
-        esc(("AXPopUpButton", pop)); raise BridgeError("model_unknown", "model %r not in the picker: %s" % (lab, names))
-    if effort and (not cur or cur[1].lower() != effort) and exists("AXSlider", "Effort"):
-        want = EFFORT[effort]
-        for _ in range(4):   # React ignores AXValue writes on this slider; AXIncrement/AXDecrement work
-            v = int(re.search(r"value=(\d+)", zc("attrs", "AXSlider", "Effort")).group(1))
-            if v == want: break
-            zc("action", "AXSlider", "Effort", "AXIncrement" if v < want else "AXDecrement"); time.sleep(0.4)
-    if not cur or cur[0].lower() != lab.lower():
-        zc("press", "AXMenuItem", "=" + lab if exists("AXMenuItem", "=" + lab) else lab); time.sleep(0.8)
-    elif popup_open(): esc(("AXPopUpButton", pop))
-    if popup_open(): esc(("AXPopUpButton", "GLM"))
-    now = composer_model()
-    if not now or now[0].lower() != lab.lower() or (effort and now[1].lower() != effort):
-        if not _again: return set_model(model, effort, _again=True)   # picking a model can reset the effort: one more pass
-        raise BridgeError("model_not_set", "model/effort not applied; the chip reads %r" % (now,))
-    return True
+    return configure_composer(model, effort)[2]
 
 
-def mode_flags():
-    """Open the mode menu and read it as {item label: checked}. Leaves the menu open."""
-    press("AXPopUpButton", "Switch mode", wait=0.8)
-    return {i[0]: i[1] == "1" for i in menu_items()}
-
-
-def _item(m, name):
-    return next((k for k in m if k.startswith(name)), None)
 
 
 PLAN_CHIP = "Remove Plan from the next submission"
@@ -556,38 +536,27 @@ def plan_on():
 
 
 def set_mode(mode):
-    """'Plan mode' is a toggle on top of the permission mode (db: planEnabled); Ask/Autonomous/Full are the radio part.
-    ask = Ask before changes, plan = Ask + plan toggle, auto = Autonomous mode, full = Full access (the radio item of the mode menu,
-    pressed directly; the permission cards' own 'Full access' and 'Always allow' buttons are never pressed).
-    Only what differs is changed: the base mode is read from the composer, Plan from its chip (present = on); the menu opens only
-    when the base mode must change or Plan must be switched on. Returns True when something was changed."""
     base = MODES["ask"] if mode == "plan" else MODES[mode]
-    cur = current_mode(); chip = plan_on(); changed = False
-    if chip and mode != "plan":
-        zc("press", "AXButton", "=" + PLAN_CHIP); time.sleep(0.7); changed = True   # ZCode's own remove-Plan button
-        if plan_on(): raise BridgeError("mode_not_set", "the Plan chip is still shown")
-        chip = False
-    if cur and cur.startswith(base) and chip == (mode == "plan"): return changed
-    # the menu is opened once; what it shows is read, the wanted items are pressed, and the result is verified from the composer's
-    # chips (mode text and Plan chip), never by opening the menu again
-    m = mode_flags(); k = _item(m, base)
-    if k is None: esc(("AXPopUpButton", "Switch mode")); raise BridgeError("mode_unknown", "mode %r not in the menu: %s" % (base, list(m)))
-    need_base = not cur or not cur.startswith(base)
-    need_plan = mode == "plan" and not chip
-    if need_base:
-        zc("press", "AXMenuItem", k); time.sleep(0.7); changed = True
-        if need_plan: m = mode_flags()   # the menu closes after a pick: Plan is a second pick
-    if need_plan:
-        zc("press", "AXMenuItem", _item(m, "Plan mode")); time.sleep(0.7); changed = True
-    if popup_open(): esc(("AXPopUpButton", "Switch mode"))
-    now = current_mode()
-    if not now or not now.startswith(base) or plan_on() != (mode == "plan"):
-        raise BridgeError("mode_not_set", "composer reads %r (Plan chip %s), wanted %s%s" % (now, "on" if plan_on() else "off", base, " + plan" if mode == "plan" else ""))
+    state = composer_snapshot(); changed = False
+    if state.get("plan") and mode != "plan":
+        press("AXButton", "=" + PLAN_CHIP, wait=0)
+        state = wait_snapshot(lambda s: not s.get("plan")); changed = True
+    if state.get("mode") == base and state.get("plan") == (mode == "plan"): return changed
+    for name in ([base] if state.get("mode") != base else []) + (["Plan mode"] if mode == "plan" and not state.get("plan") else []):
+        press("AXPopUpButton", "=Switch mode", wait=0)
+        def item(s): return next((i for i in s.get("menu_items", []) if i["name"].startswith(name)), None)
+        state = wait_snapshot(lambda s: item(s) is not None)
+        press("AXMenuItem", "=" + item(state)["name"], allow=True, wait=0)
+        if name == "Plan mode": state = wait_snapshot(lambda s: s.get("plan"))
+        else: state = wait_snapshot(lambda s: s.get("mode") == base)
+        if state.get("menu_open"): esc(("AXPopUpButton", "=Switch mode"))
+        changed = True
+    wait_snapshot(lambda s: s.get("mode") == base and s.get("plan") == (mode == "plan"))
     return changed
 
 
-def current_mode():
-    m = re.search(r'd="Switch mode"[^\n]*\n(?:[^\n]*\n)*?\s*AXStaticText v="([^"]+)"', dump())
+def current_mode(d=None):
+    m = re.search(r'd="Switch mode"[^\n]*\n(?:[^\n]*\n)*?\s*AXStaticText v="([^"]+)"', d if d is not None else dump())
     return m.group(1) if m else None
 
 
@@ -607,28 +576,34 @@ def open_project_new_task(p):
     opened. Returns True when the page shows the project selection chip."""
     d = dump(120); i = project_new_task_index(p["name"], d)
     if i is None: return False
-    zc("press", "AXButton", "=New task", nth=i, check=False); time.sleep(1.0)
-    try: wait_for("AXTextArea", "", 6)
+    zc("press", "AXButton", "=New task", nth=i, check=False)
+    try: wait_snapshot(lambda s: s.get("workspace") and s.get("model"), timeout=6)
     except BridgeError: return False
     return exists("AXButton", "=Remove current project selection")
 
 
 def choose_workspace(folder):
-    """Pick the project (or 'Work outside a project') on the New task screen; create the project when missing."""
+    """Pick the target project and wait for its composer after the menu has closed."""
     if folder is None:
-        press("AXPopUpButton", "Choose workspace"); pick_menu("Work outside a project"); return
-    p = find_project(folder)
-    CREATED["project"] = False
-    if p is None:
-        p = create_project(folder); CREATED["project"] = True
-        to_workspace(); zc("pressup", "AXStaticText", "=New task", check=False); wait_for("AXTextArea", ""); time.sleep(0.8)   # ZCode opened the new project's page
-    if open_project_new_task(p): return p
-    press("AXPopUpButton", "Choose workspace", wait=0.9)
-    items = menu_items()
-    hit = next((i for i in items if i[0] == p["name"]), None)
-    if hit is None: esc(("AXPopUpButton", "Choose workspace")); raise BridgeError("project_not_in_menu", "project %r not in the workspace menu" % p["name"])
-    if hit[-1] == "1": esc(("AXPopUpButton", "Choose workspace")); return p
-    pick_menu(p["name"]); time.sleep(0.8); return p
+        p = None; label = "Work outside a project"
+    else:
+        p = find_project(folder)
+        CREATED["project"] = False
+        if p is None:
+            p = create_project(folder); CREATED["project"] = True
+            to_workspace(); zc("pressup", "AXStaticText", "=New task", check=False)
+            wait_snapshot(lambda s: s.get("workspace") and s.get("model"))
+        if open_project_new_task(p): return p
+        label = p["name"]
+    press("AXPopUpButton", "=Choose workspace", wait=0)
+    def selected(s): return next((i for i in s.get("menu_items", []) if i["name"] == label), None)
+    state = wait_snapshot(lambda s: selected(s) is not None)
+    if selected(state).get("checked"):
+        esc(("AXPopUpButton", "=Choose workspace"))
+    else:
+        press("AXMenuItem", "=" + label, wait=0)
+    wait_snapshot(lambda s: not s.get("menu_open") and s.get("workspace") and s.get("model"))
+    return p
 
 
 def open_via_deeplink(real):
@@ -830,12 +805,11 @@ def do_send(a):
     try:
         with ui_lock() as prev:   # the lock covers only the window-driving steps, up to the Send press
             T["lock"] = time.time()
-            need_app(); guard(); to_workspace(); close_stray_popups()
+            need_app(); guard(); close_stray_popups(); to_workspace()
             before = sessions()
-            zc("pressup", "AXStaticText", "=New task", check=False); wait_for("AXTextArea", ""); time.sleep(0.8)
+            zc("pressup", "AXStaticText", "=New task", check=False); wait_snapshot(lambda s: s.get("workspace") and s.get("model"))
             proj = choose_workspace(a.folder and os.path.abspath(a.folder))
-            route, route_note = choose_route(a.route, a.model, tok) if a.route != "keep" else (current_route(), None)
-            set_model(a.model, a.effort)
+            route, route_note = choose_route(a.route, a.model, tok, effort=a.effort)
             set_mode(a.mode)
             T["setup"] = time.time()
             zc("focus", "AXTextArea", "", check=False)
@@ -891,7 +865,7 @@ def do_mode_reset(a):
     New task composer. ZCode has no settings entry for a default mode or model; what it starts a new task with is what the composer
     was last left on. Changes nothing that already reads right."""
     with ui_lock():
-        need_app(); to_workspace(); close_stray_popups()
+        need_app(); close_stray_popups(); to_workspace()
         if a.task: open_task(a.task)
         else:
             zc("pressup", "AXStaticText", "=New task", check=False); wait_for("AXTextArea", ""); time.sleep(0.6)
@@ -1291,6 +1265,7 @@ def do_rewards(a):
     --scheduled is the launchd entry (every minute): it decides by the UTC clock whether to act, logs every attempt to
     rewards-attempts.log, and stops for the day after a success. The Rewards page of the account menu is the referral program and
     has no claim button (checked)."""
+    invalidate_promo_cache()
     now = time.time(); res = dict(ok=True, at=time.strftime("%FT%T%z"), at_utc=time.strftime("%FT%TZ", time.gmtime(now)), claim_requested=bool(a.claim))
     day = time.strftime("%F", time.gmtime(now))
     try: prev = json.load(open(REWARDS_FILE))
@@ -1356,22 +1331,47 @@ def do_rewards(a):
 ROUTES = {"plan": "Z.ai", "promo": "Start Plan"}
 
 
-def open_route_picker():
-    """Open the composer's model picker. Caller holds the UI lock and is on the workspace."""
-    model = composer_model()
-    if not model: raise BridgeError("ui_element_missing", "model picker not found")
-    press("AXPopUpButton", "=" + " ".join(model), wait=0.9)
-    wait_for("AXMenuItem", "Provider:")
-    return next((n for n, _ in menu_items() if n.startswith("Provider: ")), None)
+def composer_snapshot():
+    return json.loads(zc("snapshot"))
+
+
+def wait_snapshot(predicate, timeout=8.0, initial=None):
+    end = time.monotonic() + timeout
+    state = initial
+    while True:
+        state = state if state is not None else composer_snapshot()
+        if predicate(state): return state
+        if time.monotonic() >= end: raise BridgeError("ui_element_missing", "the expected composer state did not appear: %s" % {k: state.get(k) for k in ("model", "effort", "mode", "provider", "menu_open", "workspace", "back", "ready")})
+        time.sleep(0.08); state = None
+
+
+def open_route_picker(state=None):
+    state = state if state is not None else composer_snapshot()
+    if state.get("menu_open") and state.get("provider"): return state
+    name = (state["model"] + " " + state["effort"].title()) if state.get("model") and state.get("effort") else "Choose model"
+    press("AXPopUpButton", "=" + name, wait=0)
+    return wait_snapshot(lambda s: s.get("provider") is not None)
+
+
+def close_model_menu(state=None):
+    state = state if state is not None else composer_snapshot()
+    if not state.get("menu_open"): return state
+    name = (state["model"] + " " + state["effort"].title()) if state.get("model") and state.get("effort") else "Choose model"
+    n = len(TRACE)
+    press("AXPopUpButton", "=" + name, wait=0)
+    del TRACE[n:]
+    return wait_snapshot(lambda s: not s.get("menu_open"))
+
+
+def snapshot_route(state):
+    return next((r for r, label in ROUTES.items() if state.get("provider") == label), None)
 
 
 def current_route():
-    """The composer's connection, which can differ from the default in setting.json. Caller holds the UI lock."""
-    try:
-        provider = open_route_picker()
-        return next((r for r, label in ROUTES.items() if provider == "Provider: " + label), None)
-    finally:
-        if popup_open(): esc(("AXPopUpButton", "GLM"))
+    """Read the actual composer selection; the settings file only contains a default."""
+    state = open_route_picker()
+    try: return snapshot_route(state)
+    finally: close_model_menu(state)
 
 
 def promo_ready(d=None):
@@ -1388,81 +1388,132 @@ def promo_ready(d=None):
     return None
 
 
-def read_promo_ready():
-    """Open Settings > Model settings and read the Start Plan state. Caller holds the UI lock."""
-    need_app(); to_workspace()
-    press("AXButton", "=Settings", wait=1.5); press("AXButton", "=Model settings", wait=1.5)
+PROMO_CACHE = os.path.join(STATE, "promo-ready.json")
+
+
+def invalidate_promo_cache():
+    try: os.unlink(PROMO_CACHE)
+    except FileNotFoundError: pass
+
+
+def cached_promo_ready():
     try:
-        for _ in range(10):
-            ready = promo_ready(dump(120))
-            if ready is not None: return ready
-            time.sleep(0.5)
-        return None
+        record = json.load(open(PROMO_CACHE))
+        if 0 <= time.time() - record["at"] < 30 and isinstance(record.get("ready"), bool): return record["ready"]
+    except (OSError, ValueError, KeyError): pass
+    return None
+
+
+def read_promo_ready(cached=True):
+    """A short read-through cache, shared by CLI processes. Caller holds the UI lock."""
+    if cached:
+        ready = cached_promo_ready()
+        if ready is not None: return ready
+    state = composer_snapshot()
+    if not state.get("back"):
+        press("AXButton", "=Settings", wait=0)
+        wait_snapshot(lambda s: s.get("model_settings"))
+    press("AXButton", "=Model settings", wait=0)
+    try:
+        try: ready = wait_snapshot(lambda s: s.get("ready") is not None).get("ready")
+        except BridgeError: return None
+        os.makedirs(STATE, exist_ok=True)
+        with open(PROMO_CACHE, "w") as f: json.dump(dict(at=time.time(), ready=ready), f)
+        return ready
     finally:
-        if exists("AXButton", "=Back to workspace"): press("AXButton", "=Back to workspace", wait=1.0)
+        press("AXButton", "=Back to workspace", wait=0)
+        wait_snapshot(lambda s: s.get("workspace") and not s.get("back"))
+
+
+def configure_composer(model=None, effort=None, want="keep", own=None):
+    """One model menu owns provider/model/effort changes and their verification."""
+    state = open_route_picker()
+    changed = False; note = None
+    cur = snapshot_route(state)
+    desired = cur if want == "keep" else "promo" if want == "free" else want
+    ready = None
+    try:
+        if want == "auto":
+            in_window = time.gmtime().tm_hour >= 15 or time.gmtime().tm_hour < 1
+            if "flash" in (model or state.get("model") or "").lower() and in_window:
+                ready = cached_promo_ready()
+                if ready is None:
+                    close_model_menu(state); ready = read_promo_ready(); state = open_route_picker()
+                desired = "promo" if ready else "plan"
+            else: desired = "plan"
+        if desired != cur:
+            if [e for e in slots_live() if e.get("token") != own]:
+                if want == "free": raise BridgeError("promo_unavailable", "other ZCode tasks are running; retry the free model when they finish")
+                note = "route %s wanted but other ZCode tasks are running; staying on %s" % (desired, cur)
+                desired = cur
+            if desired == "promo" and ready is None:
+                ready = cached_promo_ready()
+                if ready is None:
+                    close_model_menu(state); ready = read_promo_ready(); state = open_route_picker()
+                if ready is not True:
+                    if ready is None: raise BridgeError("promo_status_unknown", "could not read the Start Plan status in ZCode; retry after Model settings has loaded")
+                    if want == "free": raise BridgeError("promo_unavailable", "the Start Plan is not Ready in ZCode")
+                    if want == "auto": desired = cur
+                    else: raise BridgeError("promo_not_ready", "the Start Plan is not Ready in ZCode")
+            if desired != cur:
+                provider = state.get("provider")
+                if not provider: raise BridgeError("route_not_set", "Provider submenu not found")
+                press("AXMenuItem", "=Provider: " + provider, wait=0)
+                label = ROUTES[desired]
+                def offered(s): return next((i for i in s.get("menu_items", []) if i["name"] == label or i["name"].startswith(label + " ")), None)
+                state = wait_snapshot(lambda s: offered(s) is not None)
+                item = offered(state)
+                if not item.get("enabled", True): raise BridgeError("promo_unavailable" if desired == "promo" else "route_not_set", "connection %s is disabled" % label)
+                press("AXMenuItem", "=" + item["name"], wait=0)
+                state = wait_snapshot(lambda s: snapshot_route(s) == desired or not s.get("menu_open"))
+                if not state.get("menu_open"): state = open_route_picker(state)
+                if snapshot_route(state) != desired: raise BridgeError("route_not_set", "composer did not select %s" % desired)
+                cur = desired; changed = True
+        lab = MODELS.get(model, model) if model else state.get("model")
+        if lab and (state.get("model") or "").lower() != lab.lower():
+            item = next((i for i in state.get("menu_items", []) if re.match(re.escape(lab) + r"(\s|$)", i["name"])), None)
+            if not item: raise BridgeError("model_unknown", "model %r not in the selected provider" % lab)
+            press("AXMenuItem", "=" + item["name"], wait=0)
+            state = wait_snapshot(lambda s: (s.get("model") or "").lower() == lab.lower())
+            changed = True
+        if effort and state.get("effort") != effort:
+            state = open_route_picker(state)
+            state = wait_snapshot(lambda s: s.get("effort_index") is not None, initial=state)
+            target = EFFORT[effort]
+            while state["effort_index"] != target:
+                old = state["effort_index"]
+                zc("action", "AXSlider", "Effort", "AXIncrement" if old < target else "AXDecrement")
+                state = wait_snapshot(lambda s: s.get("effort_index") is not None and s.get("effort_index") != old)
+            changed = True
+        if state.get("menu_open") and snapshot_route(state) != cur:
+            raise BridgeError("route_not_set", "the selected provider changed while configuring the model")
+        state = close_model_menu(state)
+        if lab and (state.get("model") or "").lower() != lab.lower(): raise BridgeError("model_not_set", "composer model was not applied")
+        if effort and state.get("effort") != effort: raise BridgeError("model_not_set", "composer effort was not applied")
+        return cur, note, changed
+    except BridgeError:
+        invalidate_promo_cache()
+        raise
+    finally:
+        close_model_menu()
 
 
 def set_route(route):
-    """Select and verify the connection through the composer's Provider submenu. Settings rows only show account details.
-    Caller holds the UI lock. Do not reset the draft with New task afterwards: it restores the default connection."""
-    label = ROUTES[route]
-    if current_route() == route: return False
-    need_app(); to_workspace()
-    if route == "promo":
-        ready = read_promo_ready()
-        if ready is False:
-            raise BridgeError("promo_not_ready", "the Start Plan is not Ready in ZCode (not claimed today, or expired)")
-        if ready is None:
-            raise BridgeError("promo_status_unknown", "could not read the Start Plan status in ZCode; retry after Model settings has loaded")
-    try:
-        provider = open_route_picker()
-        if not provider: raise BridgeError("ui_element_missing", "Provider submenu not found")
-        press("AXMenuItem", "=" + provider, wait=0.8)
-        name = next((n for n, _ in menu_items() if n == label or n.startswith(label + " ")), None)
-        if not name: raise BridgeError("route_not_set", "connection %s is not offered in the Provider submenu" % label)
-        press("AXMenuItem", "=" + name, wait=1.0)
-    finally:
-        if popup_open(): esc(("AXPopUpButton", "GLM"))
-    actual = current_route()
-    if actual == route: return True
-    raise BridgeError("route_not_set", "the connection did not change to %s (composer reads %s)" % (route, actual))
+    return configure_composer(want=route)[2]
 
 
-def choose_route(want, model, own=None):
-    """Caller holds the UI lock. want: plan | promo | auto. Returns (route in effect, note). auto = promo for GLM-5.3-Flash when the Start Plan is Ready, else the plan.
-    A change is made only while no other ZCode task runs, because the connection is shared by the whole app."""
-    cur = current_route()
-    if want == "free":
-        # The «· Free» model in BB: the task runs on the Start Plan or not at all, never silently on the paid plan.
-        if cur == "promo": return cur, None
-        if [e for e in slots_live() if e.get("token") != own]:
-            raise BridgeError("promo_unavailable", "other ZCode tasks are running on the paid plan, and the plan is shared by the whole app; the free model can start when they finish")
-        try: set_route("promo"); return "promo", None
-        except BridgeError as e:
-            if e.code == "promo_not_ready":
-                raise BridgeError("promo_unavailable", "the Start Plan has no free tokens now (claimed daily from the sidebar banner, usable 15:00-01:00 UTC)")
-            raise
-    if want == "auto":
-        if model != "flash": want = "plan"
-        else:
-            tm = time.gmtime(); in_window = tm.tm_hour >= 15 or tm.tm_hour < 1      # the promo tokens are for use 15:00-01:00 UTC
-            want = "promo" if in_window and read_promo_ready() else "plan"
-    if want == cur: return cur, None
-    if [e for e in slots_live() if e.get("token") != own]:
-        return cur, "route %s wanted but other ZCode tasks are running; staying on %s" % (want, cur)
-    try: set_route(want); return want, None
-    except BridgeError as e:
-        if e.code == "promo_not_ready": return cur, str(e)
-        raise
+def choose_route(want, model, own=None, effort=None):
+    route, note, _ = configure_composer(model, effort, want, own)
+    return route, note
 
 
 def do_route(a):
     with ui_lock():
-        need_app(); to_workspace(); close_stray_popups()
+        need_app(); close_stray_popups(); to_workspace()
         if not a.set: return dict(ok=True, route=current_route(), promo_ready=read_promo_ready())
         if slots_live(): raise BridgeError("busy", "ZCode tasks are running; the connection is shared by the whole app, change it when they finish")
         changed = set_route(a.set)
-        return dict(ok=True, route=current_route(), changed=changed)
+        return dict(ok=True, route=a.set, changed=changed)
 
 
 # ---------------------------------------------------------------- models (what this ZCode offers)
@@ -1485,6 +1536,19 @@ def parse_model_list(d):
 
 
 def do_models(a):
+    if a.cached: return read_models_ui(a)
+    os.makedirs(STATE, exist_ok=True)
+    with open(os.path.join(STATE, "models.refresh.lock"), "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if getattr(a, "if_stale", False):
+            try:
+                cached = json.load(open(MODELS_FILE))
+                if cached.get("models") and 0 <= time.time() - cached.get("at", 0) < 86400: return dict(ok=True, **cached)
+            except (OSError, ValueError): pass
+        return read_models_ui(a)
+
+
+def read_models_ui(a):
     """The models this ZCode offers on this machine, read from its own screens (Settings > Model settings for the list and the
     enabled switches, the New task composer for ZCode's current default). Cached in ~/.zcode-bridge/models.json; the cache is
     what zcode-acp shows in BB. Reading it takes the window lock for a few seconds and changes nothing."""
@@ -1492,13 +1556,15 @@ def do_models(a):
         try: return dict(ok=True, **json.load(open(MODELS_FILE)))
         except Exception: raise BridgeError("no_cache", "no models cache yet; run `zcbridge models`")
     with ui_lock():
-        need_app(); to_workspace(); close_stray_popups()
+        need_app(); close_stray_popups(); to_workspace()
         zc("pressup", "AXStaticText", "=New task", check=False); wait_for("AXTextArea", ""); time.sleep(0.6)
         cur = composer_model()
-        press("AXButton", "=Settings", wait=1.5); press("AXButton", "=Model settings", wait=1.5)
+        press("AXButton", "=Settings", wait=0); wait_snapshot(lambda s: s.get("model_settings"))
+        press("AXButton", "=Model settings", wait=0); wait_for("AXHeading", "=Model settings")
         try: models = parse_model_list(dump(120))
         finally:
-            if exists("AXButton", "=Back to workspace"): press("AXButton", "=Back to workspace", wait=1.0)
+            press("AXButton", "=Back to workspace", wait=0)
+            wait_snapshot(lambda s: s.get("workspace") and not s.get("back"))
     res = dict(models=models, default=cur[0] if cur else None, effort=cur[1].lower() if cur else None, at=int(time.time()))
     if models:
         try: json.dump(res, open(MODELS_FILE, "w"))
@@ -1526,7 +1592,7 @@ def do_project_remove(a):
     if any(r.get("directory") and os.path.realpath(r["directory"]) in p["roots"] and r["state"] not in DONE for r in [dict(directory=x["directory"], state=task_state(x["id"])["state"]) for x in conn(DBP).execute("select id,directory from session where parent_id is null")] ):
         raise BridgeError("project_busy", "a task of this project is still running")
     with ui_lock():
-        need_app(); to_workspace(); close_stray_popups()
+        need_app(); close_stray_popups(); to_workspace()
         d = dump(120); i = project_more_index(p["name"], d)
         if i is None and exists("AXButton", "=Show more"):
             press("AXButton", "=Show more", wait=0.8); d = dump(120); i = project_more_index(p["name"], d)
@@ -1616,7 +1682,7 @@ def do_doctor(a):
         d = dump(); chk["app_running"] = True; chk["session_expired"] = bool(re.search(r"session has expired|Sign in again", d))
         for lab in ("Switch mode", "Send", "Add context"):
             chk["label:" + lab] = lab in d
-        chk["mode"] = current_mode(); chk["plan_chip"] = "Remove Plan from the next submission" in d
+        chk["mode"] = current_mode(d); chk["plan_chip"] = "Remove Plan from the next submission" in d
     except BridgeError as e:
         chk["app_running"] = e.code != "not_running"; chk["error"] = str(e)
     chk["db_readable"] = os.path.exists(DBP); chk["index_readable"] = os.path.exists(IDXP)
@@ -1631,13 +1697,13 @@ def do_ui(a):
 
 
 # ---------------------------------------------------------------- watch (JSON lines)
-def watch_events(task, seen):
+def watch_events(task, seen, cursor=None):
     """New or changed parts of a task as events. `seen` maps part id -> fingerprint and is updated in place.
     text/reasoning: {event, id, role, text (all of it so far), delta (the new tail), reset (true when the text changed in the middle)}.
     tool: {event:"tool", id (the call id), tool, status (pending|running|completed|error), input, output, error}, once per status change.
     ZCode writes a text or reasoning part to its db at the end of each model step (no earlier), so `text` arrives once per step."""
     out = []
-    for mt, seq, pid, role, j in parts(task):
+    for mt, seq, pid, role, j in parts(task, (cursor or {}).get("since", 0), cursor):
         t = j.get("type")
         if t in ("text", "reasoning"):
             txt = j.get("text") or ""
@@ -1661,12 +1727,12 @@ def watch_events(task, seen):
 
 
 def do_watch(a):
-    seen = {}; end = time.time() + a.timeout
+    seen = {}; cursor = {"since": getattr(a, "since", 0)}; end = time.time() + a.timeout
     while True:
         st = task_state(a.task)   # state first, then one more scan: a part written right before the state flipped is not lost
-        for ev in watch_events(a.task, seen): print(json.dumps(ev, ensure_ascii=False), flush=True)
+        for ev in watch_events(a.task, seen, cursor): print(json.dumps(ev, ensure_ascii=False), flush=True)
         if st["state"] in DONE or st["state"] == "waiting_approval" or time.time() > end:
-            print(json.dumps(dict(event="state", **{k: st[k] for k in ("state", "pending_approvals") if k in st}), ensure_ascii=False), flush=True); return None
+            print(json.dumps(dict(event="state", cursor=cursor["since"], **{k: st[k] for k in ("state", "pending_approvals", "tokens", "error") if k in st}), ensure_ascii=False), flush=True); return None
         time.sleep(a.poll)
 
 
@@ -1709,7 +1775,7 @@ def main(argv=None):
     p = add("wait", lambda a: dict(ok=True, task_id=a.task, **wait_task(a.task, a.timeout, a.approve, a.poll)), help="wait for the task, applying the approve policy")
     p.add_argument("task"); p.add_argument("--timeout", type=int, default=900); p.add_argument("--poll", type=float, default=2.0); p.add_argument("--approve", default="deny", choices=["deny", "project", "manual"])
     p = add("result", lambda a: dict(ok=True, task_id=a.task, state=task_state(a.task)["state"], answer=final_answer(a.task), **({"tool_calls": tool_calls(a.task)} if a.tools else {})), help="final answer"); p.add_argument("task"); p.add_argument("--tools", action="store_true")
-    p = add("watch", do_watch, help="stream parts as JSON lines until the task ends or needs approval"); p.add_argument("task"); p.add_argument("--timeout", type=int, default=900); p.add_argument("--poll", type=float, default=1.5)
+    p = add("watch", do_watch, help="stream parts as JSON lines until the task ends or needs approval"); p.add_argument("task"); p.add_argument("--timeout", type=int, default=900); p.add_argument("--poll", type=float, default=1.5); p.add_argument("--since", type=int, default=0)
     p = add("cancel", do_cancel, help="press Stop on a running task"); p.add_argument("task")
     p = add("archive", do_archive, help="archive a task (More > Archive task)"); p.add_argument("task")
     p = add("approvals", lambda a: dict(ok=True, task_id=a.task, pending=pending(a.task)), help="pending approval cards (from the db)"); p.add_argument("task")
@@ -1734,7 +1800,7 @@ def main(argv=None):
     p = add("usage", do_usage, help="token usage from the db; --quota reads ZCode's quota popover"); p.add_argument("--days", type=int, default=7); p.add_argument("--quota", action="store_true")
     p = add("rewards", do_rewards, help="daily claimable-token banner of ZCode: report, or --claim it (AX only)"); p.add_argument("--claim", action="store_true"); p.add_argument("--scheduled", action="store_true", help="for launchd: claim only in the hours 11, 12, 15 UTC and until a claim succeeded today")
     p = add("route", do_route, help="which plan pays for ZCode tasks: show, or --set plan|promo (Start Plan)"); p.add_argument("--set", choices=list(ROUTES))
-    p = add("models", do_models, help="models this ZCode offers (enabled/disabled) and its default; --cached reads the last result"); p.add_argument("--cached", action="store_true")
+    p = add("models", do_models, help="models this ZCode offers (enabled/disabled) and its default; --cached reads the last result"); p.add_argument("--cached", action="store_true"); p.add_argument("--if-stale", action="store_true")
     p = add("capabilities", do_capabilities, help="plugins, MCP servers, skills, instructions ZCode loads (names only)"); p.add_argument("--folder"); p.add_argument("--names", action="store_true"); p.add_argument("--ui", action="store_true", help="also read the counts shown in Settings > Plugins")
     p = add("automations", do_automations_list, help="list automations, runs and idle-time tasks (read-only)")
     p.add_argument("action", nargs="?", default="list", choices=["list", "create", "run", "pause", "resume", "delete"]); p.add_argument("id", nargs="?")

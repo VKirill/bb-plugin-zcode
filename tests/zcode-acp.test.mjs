@@ -80,6 +80,34 @@ test("the Flash model is offered twice: the plain one runs on the plan, the «·
   }
 });
 
+test("Free keeps the same physical model: two turns and close do not reset it or replay a baseline process", async () => {
+  const { agent, cwd, calls } = setup();
+  try {
+    await agent.request("initialize", { protocolVersion: 1 });
+    const s = await agent.request("session/new", { cwd, mcpServers: [] });
+    await agent.request("session/set_config_option", { sessionId: s.sessionId, configId: "model", value: "glm-5.3-flash-free" });
+    await prompt(agent, s.sessionId, "first");
+    agent.updates.length = 0;
+    await prompt(agent, s.sessionId, "second");
+    assert.equal(text(agent.updates), "ANSWER:second");
+    await agent.request("session/close", { sessionId: s.sessionId });
+    assert.equal(calls().filter((c) => c.startsWith("mode-reset ")).length, 0);
+    assert.equal(calls().filter((c) => c.startsWith("watch ")).length, 2);
+  } finally { agent.close(); }
+});
+
+test("a different physical model is restored once, without another reset at session close", async () => {
+  const { agent, cwd, calls } = setup();
+  try {
+    await agent.request("initialize", { protocolVersion: 1 });
+    const s = await agent.request("session/new", { cwd, mcpServers: [] });
+    await agent.request("session/set_config_option", { sessionId: s.sessionId, configId: "model", value: "glm-5.3" });
+    await prompt(agent, s.sessionId, "first");
+    await agent.request("session/close", { sessionId: s.sessionId });
+    assert.equal(calls().filter((c) => c.startsWith("mode-reset ")).length, 1);
+  } finally { agent.close(); }
+});
+
 test("a permission card becomes session/request_permission; allow runs approve, deny runs deny", async () => {
   for (const [choice, call, answer] of [["allow", "approve", "APPROVED"], ["deny", "deny", "DENIED"]]) {
     const { agent, cwd, calls } = setup();
@@ -92,6 +120,8 @@ test("a permission card becomes session/request_permission; allow runs approve, 
     const s = await agent.request("session/new", { cwd, mcpServers: [] });
     const r = await prompt(agent, s.sessionId, "approve it");
     assert.equal(r.stopReason, "end_turn");
+    assert.ok(!calls().some((c) => c.startsWith("approvals ")), "watch already supplies the pending card");
+    assert.ok(!calls().some((c) => c.startsWith("status ")), "watch already supplies final usage");
     assert.ok(calls().some((c) => c.startsWith(call + " task_")), call);
     assert.equal(text(agent.updates), answer);
     const final = agent.updates.filter((u) => u.sessionUpdate === "tool_call_update").at(-1);

@@ -39,10 +39,13 @@ func pick(_ out: [AXUIElement]) -> AXUIElement? {
     let n = Int(ProcessInfo.processInfo.environment["ZCAX_NTH"] ?? "0") ?? 0
     return n < out.count ? out[n] : nil
 }
-func find(_ e: AXUIElement, _ pred: (AXUIElement) -> Bool, _ out: inout [AXUIElement], _ depth: Int = 0) {
-    if depth > 40 { return }
+func find(_ e: AXUIElement, _ pred: (AXUIElement) -> Bool, _ out: inout [AXUIElement], _ depth: Int = 0, limit: Int = Int.max) {
+    if depth > 80 || out.count >= limit { return }
     if pred(e) { out.append(e) }
-    for k in kids(e) { find(k, pred, &out, depth + 1) }
+    for k in kids(e) {
+        if out.count >= limit { break }
+        find(k, pred, &out, depth + 1, limit: limit)
+    }
 }
 
 guard let app = NSRunningApplication.runningApplications(withBundleIdentifier: "dev.zcode.app").first else { print("ERR zcode-not-running"); exit(2) }
@@ -52,45 +55,92 @@ let wins = (attr(ax, "AXWindows") as? [AXUIElement]) ?? []
 guard let win = wins.first(where: { str($0,"AXRole") == "AXWindow" && str($0,"AXSubrole") == "AXStandardWindow" }) ?? wins.first(where: { str($0,"AXRole") == "AXWindow" }) else { print("ERR no-window"); exit(2) }
 let a = CommandLine.arguments
 let cmd = a.count > 1 ? a[1] : "dump"
+let matchLimit = ["find", "count"].contains(cmd) ? Int.max : max(1, (Int(ProcessInfo.processInfo.environment["ZCAX_NTH"] ?? "0") ?? 0) + 1)
 switch cmd {
+case "snapshot":
+    var controls: [AXUIElement] = []
+    let roles: Set<String> = ["AXPopUpButton", "AXButton", "AXMenuItem", "AXMenu", "AXSlider", "AXTextArea"]
+    find(win, { roles.contains(str($0, "AXRole")) }, &controls)
+    var state: [String: Any] = ["model": NSNull(), "effort": NSNull(), "mode": NSNull(), "provider": NSNull(), "effort_index": NSNull(), "ready": NSNull()]
+    var items: [[String: Any]] = []
+    var menuOpen = false, workspace = false, back = false, modelSettings = false, plan = false
+    for e in controls {
+        let role = str(e, "AXRole"), desc = str(e, "AXDescription"), title = str(e, "AXTitle")
+        let name = !title.isEmpty ? title : desc
+        if role == "AXMenu" { menuOpen = true }
+        if role == "AXTextArea" { workspace = true }
+        if role == "AXSlider" && desc == "Effort" { state["effort_index"] = Int(str(e, "AXValue")); menuOpen = true }
+        if role == "AXButton" {
+            if desc == "Back to workspace" { back = true }
+            if desc == "Model settings" { modelSettings = true }
+            if desc == "Remove Plan from the next submission" { plan = true }
+            if desc == "Start Plan" {
+                var images: [AXUIElement] = []
+                find(e, { str($0, "AXRole") == "AXImage" }, &images)
+                if let image = images.first(where: { ["Ready", "Not ready"].contains(str($0, "AXDescription")) }) { state["ready"] = str(image, "AXDescription") == "Ready" }
+            }
+        }
+        if role == "AXPopUpButton" {
+            for effort in ["Low", "High", "Max"] where name.hasSuffix(" " + effort) {
+                state["model"] = String(name.dropLast(effort.count + 1)); state["effort"] = effort.lowercased()
+            }
+            if desc == "Switch mode" {
+                var texts: [AXUIElement] = []
+                find(e, { str($0, "AXRole") == "AXStaticText" }, &texts, limit: 1)
+                if let text = texts.first { state["mode"] = str(text, "AXValue") }
+            }
+        }
+        if role == "AXMenuItem" {
+            let value = name.isEmpty ? str(e, "AXValue") : name
+            items.append(["name": value, "checked": str(e, "AXValue") == "1", "enabled": str(e, "AXEnabled") != "0"])
+            if value.hasPrefix("Provider: ") { state["provider"] = String(value.dropFirst(10)) }
+        }
+    }
+    state["menu_items"] = items; state["menu_open"] = menuOpen; state["workspace"] = workspace
+    state["back"] = back; state["model_settings"] = modelSettings; state["plan"] = plan
+    print(String(data: try JSONSerialization.data(withJSONObject: state, options: [.sortedKeys]), encoding: .utf8)!)
+case "exists":
+    var out: [AXUIElement] = []
+    find(win, { matches($0, a[2], a[3]) }, &out, limit: 1)
+    print(out.isEmpty ? "0" : "1")
 case "dump":
     dump(win, 0, a.count > 2 ? Int(a[2])! : 30, 200)
 case "find":  // find <role> <substring>  -> prints matches
     var out: [AXUIElement] = []
-    find(win, { matches($0, a[2], a[3]) }, &out)
+    find(win, { matches($0, a[2], a[3]) }, &out, limit: matchLimit)
     for e in out { print(label(e) + (str(e,"AXEnabled") == "0" ? " [disabled]" : "")) }
 case "press": // press <role> <substring>  (AXPress on the first match)
     var out: [AXUIElement] = []
-    find(win, { matches($0, a[2], a[3]) }, &out)
+    find(win, { matches($0, a[2], a[3]) }, &out, limit: matchLimit)
     guard let e = pick(out) else { print("ERR not-found"); exit(3) }
     let r = AXUIElementPerformAction(e, "AXPress" as CFString)
     print(r == .success ? "OK pressed \(label(e))" : "ERR press \(r.rawValue)")
 case "action": // action <role> <substring> <AXAction>
     var out: [AXUIElement] = []
-    find(win, { matches($0, a[2], a[3]) }, &out)
+    find(win, { matches($0, a[2], a[3]) }, &out, limit: matchLimit)
     guard let e = pick(out) else { print("ERR not-found"); exit(3) }
     let r = AXUIElementPerformAction(e, a[4] as CFString)
     print(r == .success ? "OK \(a[4]) \(label(e))" : "ERR action \(r.rawValue)")
 case "attrs": // attrs <role> <substring> -> key attributes and actions
     var out: [AXUIElement] = []
-    find(win, { matches($0, a[2], a[3]) }, &out)
+    find(win, { matches($0, a[2], a[3]) }, &out, limit: matchLimit)
     guard let e = pick(out) else { print("ERR not-found"); exit(3) }
     var names: CFArray?
     AXUIElementCopyActionNames(e, &names)
     print("value=\(str(e,"AXValue")) min=\(str(e,"AXMinValue")) max=\(str(e,"AXMaxValue")) enabled=\(str(e,"AXEnabled")) selected=\(str(e,"AXSelected")) actions=\((names as? [String]) ?? [])")
 case "setnum": // setnum <role> <substring> <number>  (sliders)
     var out: [AXUIElement] = []
-    find(win, { matches($0, a[2], a[3]) }, &out)
+    find(win, { matches($0, a[2], a[3]) }, &out, limit: matchLimit)
     guard let e = pick(out) else { print("ERR not-found"); exit(3) }
     let r = AXUIElementSetAttributeValue(e, "AXValue" as CFString, NSNumber(value: Double(a[4])!))
     print(r == .success ? "OK set" : "ERR set \(r.rawValue)")
 case "count": // count <role> <substring>
     var out: [AXUIElement] = []
-    find(win, { matches($0, a[2], a[3]) }, &out)
+    find(win, { matches($0, a[2], a[3]) }, &out, limit: matchLimit)
     print(out.count)
 case "pressup": // pressup <role> <substring>: find the element, then AXPress it or its nearest ancestor that supports AXPress
     var out: [AXUIElement] = []
-    find(win, { matches($0, a[2], a[3]) }, &out)
+    find(win, { matches($0, a[2], a[3]) }, &out, limit: matchLimit)
     guard var e = pick(out) else { print("ERR not-found"); exit(3) }
     for _ in 0..<8 {
         var names: CFArray?
@@ -110,20 +160,20 @@ case "windowid":
     }
 case "setvalue": // setvalue <role> <substring> <text>
     var out: [AXUIElement] = []
-    find(win, { matches($0, a[2], a[3]) }, &out)
+    find(win, { matches($0, a[2], a[3]) }, &out, limit: matchLimit)
     guard let e = pick(out) else { print("ERR not-found"); exit(3) }
     let r = AXUIElementSetAttributeValue(e, "AXValue" as CFString, a[4] as CFString)
     print(r == .success ? "OK set" : "ERR set \(r.rawValue)")
 case "settext": // settext <role> <substring> <text>: put text into a rich editor through AXSelectedText (works on the Electron contenteditable composer; AXValue does not)
     var out: [AXUIElement] = []
-    find(win, { matches($0, a[2], a[3]) }, &out)
+    find(win, { matches($0, a[2], a[3]) }, &out, limit: matchLimit)
     guard let e = pick(out) else { print("ERR not-found"); exit(3) }
     AXUIElementSetAttributeValue(e, "AXFocused" as CFString, kCFBooleanTrue)
     let r = AXUIElementSetAttributeValue(e, "AXSelectedText" as CFString, a[4] as CFString)
     print(r == .success ? "OK set" : "ERR set \(r.rawValue)")
 case "selectall": // selectall <role> <substring>: select the whole content through AXSelectedTextRange (so settext replaces it)
     var out: [AXUIElement] = []
-    find(win, { matches($0, a[2], a[3]) }, &out)
+    find(win, { matches($0, a[2], a[3]) }, &out, limit: matchLimit)
     guard let e = pick(out) else { print("ERR not-found"); exit(3) }
     let n = Int(str(e, "AXNumberOfCharacters")) ?? 0
     var rng = CFRange(location: 0, length: n)
@@ -144,7 +194,7 @@ case "bgpaste", "bgclear", "bgpress": // bgpaste <role> <substring> <text> | bgc
     // the ~150-300 ms the menu press takes and the previous app is brought back at once. The queued paste still lands afterwards; the
     // clipboard is restored only after the text is visible (an earlier restore would paste the OLD clipboard).
     var out: [AXUIElement] = []
-    find(win, { matches($0, a[2], a[3]) }, &out)
+    find(win, { matches($0, a[2], a[3]) }, &out, limit: matchLimit)
     guard var e = pick(out) else { print("ERR not-found"); exit(3) }
     let t0 = Date()
     func ms() -> Int { Int(Date().timeIntervalSince(t0) * 1000) }
@@ -222,17 +272,25 @@ case "bgpaste", "bgclear", "bgpress": // bgpaste <role> <substring> <text> | bgc
     let baseLen = n0 <= 1 ? 0 : n0
     var ok = false
     let deadline = Date(timeIntervalSinceNow: 4 + Double(wantLen) / 1500)
+    var nextLookup = Date(timeIntervalSinceNow: 0.3)
+    var reacquired = 0
     while !ok && Date() < deadline {
+        if Date() >= nextLookup && reacquired < 2 {
+            var fresh: [AXUIElement] = []
+            find(win, { matches($0, a[2], a[3]) }, &fresh, limit: matchLimit)
+            if let current = pick(fresh) { e = current }
+            reacquired += 1; nextLookup = Date(timeIntervalSinceNow: 0.5)
+        }
         let v = str(e, "AXValue")
         ok = cmd == "bgpress" ? true : isPaste ? (v.trimmingCharacters(in: .whitespacesAndNewlines).hasSuffix(probe) && v.utf16.count >= baseLen + wantLen - 2) : v.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         if !ok { spin(0.02) }
     }
     remin()
     restoreClipboard()
-    print(ok ? "OK \(cmd) focus=\(tFocus)ms (activate=\(tAct)ms) back=\(tBack)ms visible=\(ms())ms" : "ERR text-not-visible")
+    print(ok ? "OK \(cmd) reacquired=\(reacquired) focus=\(tFocus)ms (activate=\(tAct)ms) back=\(tBack)ms visible=\(ms())ms" : "ERR text-not-visible activate=\(tAct)ms focus=\(tFocus)ms back=\(tBack)ms visible=\(ms())ms reacquired=\(reacquired)")
 case "textlen": // textlen <role> <substring>: AXValue length (UTF-16 units), AXNumberOfCharacters and the last 40 characters (dump cuts values at 200)
     var out: [AXUIElement] = []
-    find(win, { matches($0, a[2], a[3]) }, &out)
+    find(win, { matches($0, a[2], a[3]) }, &out, limit: matchLimit)
     guard let e = pick(out) else { print("ERR not-found"); exit(3) }
     let v = str(e, "AXValue")
     print("OK len=\(v.utf16.count) chars=\(str(e, "AXNumberOfCharacters")) tail=\(v.suffix(40).replacingOccurrences(of: "\n", with: "\\n"))")
@@ -243,7 +301,7 @@ case "texts": // texts <minLen>: full AXValue of every AXStaticText with at leas
     for e in out { print(str(e, "AXValue").replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\n", with: "\\n")) }
 case "focus": // focus <role> <substring>
     var out: [AXUIElement] = []
-    find(win, { matches($0, a[2], a[3]) }, &out)
+    find(win, { matches($0, a[2], a[3]) }, &out, limit: matchLimit)
     guard let e = pick(out) else { print("ERR not-found"); exit(3) }
     let r = AXUIElementSetAttributeValue(e, "AXFocused" as CFString, kCFBooleanTrue)
     print(r == .success ? "OK focused" : "ERR focus \(r.rawValue)")

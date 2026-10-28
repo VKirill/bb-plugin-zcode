@@ -45,7 +45,7 @@ async function bridge(bin: string, args: string[], timeout: number): Promise<Rec
   }
 }
 
-async function status(opts: { models?: boolean; quota?: boolean } = {}): Promise<HostStatus> {
+async function readStatus(): Promise<HostStatus> {
   const problems: string[] = [];
   const platform = process.platform;
   const appPath = ["/Applications/ZCode.app", path.join(HOME, "Applications/ZCode.app")].find((p) => fs.existsSync(p)) ?? null;
@@ -100,7 +100,6 @@ async function status(opts: { models?: boolean; quota?: boolean } = {}): Promise
       problems.push("ZCode is not running.");
     }
   }
-  if (opts.models) await bridge(bin, ["models"], 120000);
   const m = readJson<{ models?: { name: string; enabled: boolean }[]; default?: string }>(path.join(STATE, "models.json"));
   out.models = m?.models ?? [];
   out.defaultModel = m?.default ?? null;
@@ -108,10 +107,30 @@ async function status(opts: { models?: boolean; quota?: boolean } = {}): Promise
   out.route = setting?.providerFamilyConnectionSelections?.zai?.kind ?? null;
   const r = readJson<any>(path.join(STATE, "rewards.json"));
   out.rewards = r ? { status: r.status ?? null, atUtc: r.at_utc ?? null, claimedDay: r.claimed_day ?? null, bannerSeen: typeof r.banner_seen === "boolean" ? r.banner_seen : null } : null;
+
+  return out;
+}
+
+let cachedStatus: { at: number; promise: Promise<HostStatus> } | null = null;
+async function status(opts: { models?: boolean; quota?: boolean } = {}): Promise<HostStatus> {
+  if (!cachedStatus || Date.now() - cachedStatus.at >= 5000) {
+    cachedStatus = { at: Date.now(), promise: readStatus().catch((e) => { cachedStatus = null; throw e; }) };
+  }
+  const out = structuredClone(await cachedStatus.promise);
+  const bin = findCommand("zcbridge");
+  if (!bin) return out;
+  if (opts.models) {
+    const result = await bridge(bin, ["models"], 120000);
+    if (result?.ok) {
+      const models = readJson<{ models?: { name: string; enabled: boolean }[]; default?: string }>(path.join(STATE, "models.json"));
+      out.models = models?.models ?? []; out.defaultModel = models?.default ?? null;
+      cachedStatus = null;
+    }
+  }
   if (opts.quota) {
     const q = await bridge(bin, ["usage", "--days", "1", "--quota"], 120000);
     out.quota = q?.quota ?? null;
-    if (!out.quota) problems.push("Could not read the quota from ZCode.");
+    if (!out.quota) out.problems.push("Could not read the quota from ZCode.");
   }
   return out;
 }
