@@ -59,18 +59,20 @@ let matchLimit = ["find", "count"].contains(cmd) ? Int.max : max(1, (Int(Process
 switch cmd {
 case "snapshot":
     var controls: [AXUIElement] = []
-    let roles: Set<String> = ["AXPopUpButton", "AXButton", "AXMenuItem", "AXMenu", "AXSlider", "AXTextArea"]
+    let roles: Set<String> = ["AXPopUpButton", "AXButton", "AXMenuItem", "AXMenu", "AXSlider", "AXTextArea", "AXHeading"]
     find(win, { roles.contains(str($0, "AXRole")) }, &controls)
     var state: [String: Any] = ["model": NSNull(), "effort": NSNull(), "mode": NSNull(), "provider": NSNull(), "effort_index": NSNull(), "ready": NSNull()]
     var items: [[String: Any]] = []
-    var menuOpen = false, workspace = false, back = false, modelSettings = false, plan = false
+    var menuOpen = false, workspace = false, back = false, modelSettings = false, plan = false, newTask = false, projectSelected = false
     for e in controls {
         let role = str(e, "AXRole"), desc = str(e, "AXDescription"), title = str(e, "AXTitle")
         let name = !title.isEmpty ? title : desc
         if role == "AXMenu" { menuOpen = true }
-        if role == "AXTextArea" { workspace = true }
+        if role == "AXTextArea" { workspace = true; state["composer_empty"] = str(e, "AXValue").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        if role == "AXHeading" && title == "Start Plan quota available" { state["promo_offer"] = true }
         if role == "AXSlider" && desc == "Effort" { state["effort_index"] = Int(str(e, "AXValue")); menuOpen = true }
         if role == "AXButton" {
+            if desc == "Remove current project selection" { projectSelected = true }
             if desc == "Back to workspace" { back = true }
             if desc == "Model settings" { modelSettings = true }
             if desc == "Remove Plan from the next submission" { plan = true }
@@ -81,6 +83,7 @@ case "snapshot":
             }
         }
         if role == "AXPopUpButton" {
+            if desc == "Choose workspace" { newTask = true }
             for effort in ["Low", "High", "Max"] where name.hasSuffix(" " + effort) {
                 state["model"] = String(name.dropLast(effort.count + 1)); state["effort"] = effort.lowercased()
             }
@@ -98,6 +101,7 @@ case "snapshot":
     }
     state["menu_items"] = items; state["menu_open"] = menuOpen; state["workspace"] = workspace
     state["back"] = back; state["model_settings"] = modelSettings; state["plan"] = plan
+    state["new_task"] = newTask; state["project_selected"] = projectSelected
     print(String(data: try JSONSerialization.data(withJSONObject: state, options: [.sortedKeys]), encoding: .utf8)!)
 case "exists":
     var out: [AXUIElement] = []

@@ -173,8 +173,9 @@ def choose(*a, **kw):
  return selected, None
 m.choose_route = choose
 m.set_model = m.set_mode = lambda *a: None
-def submit(*a):
+def submit(text):
  assert selected == 'promo', 'New task or workspace reset the free connection before Send'
+ assert m.re.match(r'^\\[bb:[0-9a-f]{6}\\] ', text), 'new tasks need their unique lookup tag'
 m.submit = submit
 m.wait_new_session = lambda *a: 'session_test'
 m.log = lambda *a: None

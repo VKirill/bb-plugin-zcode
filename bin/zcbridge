@@ -270,6 +270,9 @@ def ui_lock(timeout=None):
     try:
         prev = frontmost(); FOCUS.setdefault("before", prev)
         st0 = reveal()
+        if prev != BUNDLE:
+            subprocess.run(["open", "-b", BUNDLE], capture_output=True, timeout=10, check=True)
+            if frontmost() != BUNDLE: zc("activate")
         yield prev
     finally:
         # hand the desktop back to whatever the owner was using (background: only if something moved focus)
@@ -539,7 +542,7 @@ def set_mode(mode):
     base = MODES["ask"] if mode == "plan" else MODES[mode]
     state = composer_snapshot(); changed = False
     if state.get("plan") and mode != "plan":
-        press("AXButton", "=" + PLAN_CHIP, wait=0)
+        press("AXButton", "=" + PLAN_CHIP, allow=True, wait=0)
         state = wait_snapshot(lambda s: not s.get("plan")); changed = True
     if state.get("mode") == base and state.get("plan") == (mode == "plan"): return changed
     for name in ([base] if state.get("mode") != base else []) + (["Plan mode"] if mode == "plan" and not state.get("plan") else []):
@@ -577,9 +580,9 @@ def open_project_new_task(p):
     d = dump(120); i = project_new_task_index(p["name"], d)
     if i is None: return False
     zc("press", "AXButton", "=New task", nth=i, check=False)
-    try: wait_snapshot(lambda s: s.get("workspace") and s.get("model"), timeout=6)
+    try: wait_snapshot(lambda s: s.get("new_task") and s.get("project_selected") and s.get("model"), timeout=6)
     except BridgeError: return False
-    return exists("AXButton", "=Remove current project selection")
+    return True
 
 
 def choose_workspace(folder):
@@ -591,17 +594,16 @@ def choose_workspace(folder):
         CREATED["project"] = False
         if p is None:
             p = create_project(folder); CREATED["project"] = True
-            to_workspace(); zc("pressup", "AXStaticText", "=New task", check=False)
-            wait_snapshot(lambda s: s.get("workspace") and s.get("model"))
-        if open_project_new_task(p): return p
+            to_workspace()
+        if not composer_snapshot().get("new_task") and open_project_new_task(p): return p
         label = p["name"]
+    if not composer_snapshot().get("new_task"):
+        zc("pressup", "AXStaticText", "=New task", check=False)
+        wait_snapshot(lambda s: s.get("new_task") and s.get("model"))
     press("AXPopUpButton", "=Choose workspace", wait=0)
     def selected(s): return next((i for i in s.get("menu_items", []) if i["name"] == label), None)
     state = wait_snapshot(lambda s: selected(s) is not None)
-    if selected(state).get("checked"):
-        esc(("AXPopUpButton", "=Choose workspace"))
-    else:
-        press("AXMenuItem", "=" + label, wait=0)
+    press("AXMenuItem", "=" + label, wait=0)
     wait_snapshot(lambda s: not s.get("menu_open") and s.get("workspace") and s.get("model"))
     return p
 
@@ -780,7 +782,11 @@ def submit(prompt):
     for _ in range(12):   # Send stays disabled until the page has registered the pasted text
         if "[disabled]" not in zc("find", "AXButton", "=Send", check=False): break
         time.sleep(0.4)
-    press("AXButton", "=Send", wait=0.5)
+    press("AXButton", "=Send", wait=0)
+    state = wait_snapshot(lambda s: s.get("promo_offer") or s.get("composer_empty"))
+    if state.get("promo_offer"):
+        press("AXButton", "=Not now", wait=0)
+        wait_snapshot(lambda s: not s.get("promo_offer") and s.get("composer_empty"))
 
 
 def check_mode_policy(a):
@@ -807,7 +813,6 @@ def do_send(a):
             T["lock"] = time.time()
             need_app(); guard(); close_stray_popups(); to_workspace()
             before = sessions()
-            zc("pressup", "AXStaticText", "=New task", check=False); wait_snapshot(lambda s: s.get("workspace") and s.get("model"))
             proj = choose_workspace(a.folder and os.path.abspath(a.folder))
             route, route_note = choose_route(a.route, a.model, tok, effort=a.effort)
             set_mode(a.mode)
@@ -816,6 +821,7 @@ def do_send(a):
             if a.folder and proj:   # the folder lies inside a bigger project (its git repository): say where to work
                 real = os.path.realpath(a.folder); root = next((r for r in (os.path.realpath(x) for x in proj["roots"]) if real != r and real.startswith(r + os.sep)), None)
                 if root: prompt = "(Work inside the subfolder %s of this project; the project root is %s.)\n\n%s" % (os.path.relpath(real, root), root, prompt)
+            if not getattr(a, "no_tag", False): prompt = "[bb:%s] %s" % (tag, prompt)
             submit(prompt)
             T["sent"] = time.time()
         roots = {os.path.realpath(r) for r in (proj or {}).get("roots", [])} or ({os.path.realpath(a.folder)} if a.folder else None)
@@ -846,16 +852,15 @@ def wait_new_session(before, folder=None, prompt=None):
     """The session this send created: new top-level, in the folder asked for, and (when other sends started meanwhile) the one
     whose first message is our prompt. Other bridge processes may start tasks while we look, so the newest id is not enough."""
     want = " ".join((prompt or "").split())[:60]
-    for _ in range(40):
+    for _ in range(400):
         new = sessions() - before
         if folder and new:
             c = conn(DBP); new = {i for i in new if os.path.realpath(c.execute("select directory from session where id=?", (i,)).fetchone()[0] or "") in folder}
-        if len(new) > 1 and want:
-            hit = {i for i in new if " ".join(first_user_text(i).split())[:60] == want}
-            if hit: new = hit
+        if new and want:
+            new = {i for i in new if " ".join(first_user_text(i).split())[:60] == want}
         if new:
             c = conn(DBP); return sorted(new, key=lambda i: c.execute("select time_created from session where id=?", (i,)).fetchone()[0])[0]
-        time.sleep(1)
+        time.sleep(0.1)
     raise BridgeError("no_new_session", "Send was pressed but no new session appeared in ZCode's db")
 
 
@@ -883,22 +888,28 @@ def do_continue(a):
     if st["state"] not in DONE and not a.force:
         raise BridgeError("task_busy", "task is %s; wait for it or pass --force to queue the follow-up (ZCode setting 'Interaction behavior: Queue')" % st["state"])
     n0 = st["turns"]
+    T = {"t0": time.monotonic()}
     tok = slot_acquire(a.queue_timeout, "continue " + a.task)
+    T["slot"] = time.monotonic()
     bound = False
     try:
         with ui_lock():
+            T["lock"] = time.monotonic()
             open_task(a.task); guard()
             if a.mode: set_mode(a.mode)
+            T["setup"] = time.monotonic()
             zc("focus", "AXTextArea", "", check=False)
             submit(prompt)
-        for _ in range(30):   # the new user turn shows in the db a moment after Send; no UI lock needed to see it
+            T["sent"] = time.monotonic()
+        for _ in range(300):   # the new user turn shows in the db a moment after Send; no UI lock needed to see it
             if task_state(a.task)["turns"] > n0: break
-            time.sleep(1)
+            time.sleep(0.1)
         else: raise BridgeError("no_new_turn", "Send was pressed but the task shows no new user turn")
         slot_update(tok, task_id=a.task, at=time.time()); bound = True
     finally:
         if not bound: slot_release(tok)
-    res = dict(ok=True, task_id=a.task, turn=n0 + 1)
+    res = dict(ok=True, task_id=a.task, turn=n0 + 1, timings_ms=dict(slot_wait=int((T["slot"]-T["t0"])*1000), lock_wait=int((T["lock"]-T["slot"])*1000), ui_open_and_mode=int((T["setup"]-T["lock"])*1000), ui_paste_and_send=int((T["sent"]-T["setup"])*1000), lock_held=int((T["sent"]-T["lock"])*1000)))
+    log("continue %s menus_opened %d timings %s" % (a.task, len(TRACE), res["timings_ms"]))
     if a.wait: res.update(wait_task(a.task, a.timeout, a.approve, a.poll))
     return res
 

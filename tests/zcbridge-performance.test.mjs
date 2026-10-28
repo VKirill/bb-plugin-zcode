@@ -134,3 +134,104 @@ print(json.dumps(dict(planned=planned, final=state)))
   assert.equal(r.final.mode, "Full access");
   assert.equal(r.final.plan, false);
 });
+
+test("project navigation waits for the new-task project chip, not the previous task's editor", () => {
+  const r = python(`
+states = iter([dict(workspace=True,model='Flash',new_task=False,project_selected=False), dict(workspace=True,model='Flash',new_task=True,project_selected=True)])
+m.dump=lambda *a: 'AXButton t="work2"\\n  AXButton d="New task"'
+m.zc=lambda *a,**kw: 'OK'
+m.composer_snapshot=lambda: next(states)
+m.exists=lambda *a: False
+m.time.sleep=lambda _: None
+print(json.dumps(m.open_project_new_task(dict(name='work2'))))
+`);
+  assert.equal(r, true);
+});
+
+test("session discovery waits for this prompt when one unrelated task appears first", () => {
+  const r = python(`
+scans=iter([{'foreign'},{'foreign','own'}])
+m.sessions=lambda: next(scans)
+m.first_user_text=lambda sid: '[bb:123456] mine' if sid=='own' else 'someone else'
+class DB:
+ def execute(self, sql, args):
+  self.sid=args[0]; return self
+ def fetchone(self): return [1 if self.sid=='foreign' else 2]
+m.conn=lambda _: DB()
+m.time.sleep=lambda _: None
+print(json.dumps(m.wait_new_session(set(),prompt='[bb:123456] mine')))
+`);
+  assert.equal(r, "own");
+});
+
+test("Send handles the Start Plan suggestion without switching the requested paid route", () => {
+  const r = python(`
+calls=[]
+m.guard=lambda: None
+m.composer_text=lambda: 'AXTextArea v="\\\\n"'
+m.paste=lambda _: True
+m.zc=lambda *a,**kw: ''
+m.press=lambda role,label,**kw: calls.append(label)
+m.composer_snapshot=lambda: dict(promo_offer=True,composer_empty=False) if len(calls)==1 else dict(promo_offer=False,composer_empty=True)
+m.submit('test')
+print(json.dumps(calls))
+`);
+  assert.deepEqual(r, ["=Send", "=Not now"]);
+});
+
+test("an already selected workspace is confirmed by its item, without toggling its trigger", () => {
+  const r = python(`
+m.find_project=lambda _: dict(name='work2')
+state=dict(new_task=True,workspace=True,model='Flash',menu_open=False,menu_items=[])
+m.composer_snapshot=lambda: dict(state)
+calls=[]
+def press(role,label,**kw):
+ calls.append([role,label])
+ state['menu_open']=role=='AXPopUpButton'
+ state['menu_items']=[dict(name='work2',checked=True)] if state['menu_open'] else []
+m.press=press
+m.esc=lambda *a: (_ for _ in ()).throw(AssertionError('do not toggle workspace trigger'))
+print(json.dumps(dict(project=m.choose_workspace('/project'),calls=calls)))
+`);
+  assert.deepEqual(r.calls, [["AXPopUpButton", "=Choose workspace"], ["AXMenuItem", "=work2"]]);
+});
+
+test("UI navigation activates ZCode once and restores the previous app even on an error", () => {
+  const r = python(`
+with tempfile.TemporaryDirectory() as d:
+ m.STATE=d
+ front=['com.example.Editor']; calls=[]
+ m.frontmost=lambda: front[0]
+ m.reveal=lambda: {}
+ def zc(*a,**kw):
+  calls.append(a[0]); front[0]=m.BUNDLE; return 'OK'
+ m.zc=zc
+ def run(*a,**kw):
+  activating=a[0][0]=='open'
+  calls.append('activate' if activating else 'restore'); front[0]=m.BUNDLE if activating else 'com.example.Editor'
+ m.subprocess.run=run
+ try:
+  with m.ui_lock():
+   assert front[0]==m.BUNDLE
+   raise ValueError('test failure')
+ except ValueError: pass
+ print(json.dumps(dict(calls=calls,front=front[0])))
+`);
+  assert.deepEqual(r.calls, ["activate", "restore"]);
+  assert.equal(r.front, "com.example.Editor");
+});
+
+test("removing the Plan chip is allowed by the real button policy", () => {
+  const r = python(`
+state=dict(mode='Full access',plan=True,menu_open=False)
+m.composer_snapshot=lambda: dict(state)
+m.time.sleep=lambda _: None
+def zc(*a,**kw):
+ assert a==('press','AXButton','='+m.PLAN_CHIP)
+ state['plan']=False; return 'OK'
+m.zc=zc
+print(json.dumps(dict(changed=m.set_mode('full'),plan=state['plan'])))
+`);
+  assert.equal(r.plan, false);
+  assert.equal(r.changed, true);
+});
