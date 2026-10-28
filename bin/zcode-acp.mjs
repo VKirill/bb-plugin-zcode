@@ -34,7 +34,7 @@ import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
 
-const VERSION = "0.5.0";
+const VERSION = "0.5.1";
 const HOME = os.homedir();
 const STATE_DIR = path.join(HOME, ".zcode-bridge");
 const BRIDGE = process.env.ZCODE_ACP_BRIDGE || [path.join(path.dirname(fs.realpathSync(process.argv[1] || ".")), "zcbridge"), path.join(HOME, ".local", "bin", "zcbridge"), path.join(HOME, ".agents", "bin", "zcbridge")].find((f) => fs.existsSync(f)) || "zcbridge";

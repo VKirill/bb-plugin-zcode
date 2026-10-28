@@ -235,3 +235,25 @@ print(json.dumps(dict(changed=m.set_mode('full'),plan=state['plan'])))
   assert.equal(r.plan, false);
   assert.equal(r.changed, true);
 });
+
+test("duplicate automatic titles use the unique prompt tag inside the conversation, not Copy session ID", () => {
+  const r = python(`
+class DB:
+ def execute(self,*a): return self
+ def fetchone(self): return [2]
+m.conn=lambda _: DB()
+m.task_tag=lambda _: '[bb:123456]'
+m.last_prompt=lambda _: 'second prompt'
+clips=[]
+def clip(): clips.append('copy'); return 's'
+m.clip_session_id=clip
+m.dump=lambda: 'AXGroup id=sidebar\\n  AXStaticText v="other"\\nAXGroup id=conversation\\n  AXStaticText v="[bb:123456] first prompt"\\n  AXStaticText v="second prompt"\\nAXGroup id=terminal'
+correct=m.verify_open('s',dict(title='Same generated title'))
+m.dump=lambda: 'AXGroup id=sidebar\\n  AXStaticText v="[bb:123456] first prompt"\\nAXGroup id=conversation\\n  AXStaticText v="second prompt"'
+fallback=m.verify_open('s',dict(title='Same generated title'))
+print(json.dumps(dict(correct=correct,fallback=fallback,clips=clips)))
+`);
+  assert.equal(r.correct, true);
+  assert.equal(r.fallback, true);
+  assert.deepEqual(r.clips, ["copy"]);
+});

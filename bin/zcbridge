@@ -29,7 +29,7 @@ DBP = os.path.join(HOME, ".zcode/cli/db/db.sqlite")
 IDXP = os.path.join(HOME, ".zcode/v2/tasks-index.sqlite")
 STATE = os.path.join(HOME, ".zcode-bridge")
 BUNDLE = "dev.zcode.app"
-VERSION = "0.5.0"
+VERSION = "0.5.1"
 FOREGROUND = False                      # --foreground: the old path (activate ZCode, paste with Cmd+V, press keys); default is background
 TRACE = []                              # menus (popup buttons) pressed in this run, for the ui_trace of a send/continue result
 TRACE_T0 = time.time()
@@ -486,6 +486,21 @@ def tag_in_title(title):
 def verify_open(sid, s, rows=None):
     """Prove the open page is task `sid`. Foreground, or several tasks sharing the title: ZCode's own 'Copy session ID'.
     Background with a unique title: the heading matches and the page shows the task's last prompt (no clipboard, no focus change)."""
+    if not FOREGROUND:
+        tag = task_tag(sid)
+        if tag:
+            lines = dump().splitlines(); body = []
+            for i, line in enumerate(lines):
+                if line.strip() != "AXGroup id=conversation": continue
+                indent = len(line) - len(line.lstrip())
+                for child in lines[i + 1:]:
+                    if child.strip() and len(child) - len(child.lstrip()) <= indent: break
+                    body.append(child)
+                break
+            text = "\n".join(body)
+            if tag in text:
+                snip = last_prompt(sid)
+                if snip is None or snip in text: return True
     same = conn(DBP).execute("select count(*) from session where title=? and parent_id is null", (s["title"],)).fetchone()[0]
     if FOREGROUND or same != 1: return clip_session_id() == sid
     snip = last_prompt(sid)
