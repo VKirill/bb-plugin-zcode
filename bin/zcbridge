@@ -16,7 +16,9 @@ Every UI result carries "focus": {before, after, unchanged}. Pure AX actions add
 Concurrency. ZCode runs different tasks (sessions) at the same time, so the lock is held only for the steps that drive the window (choose
 project/model/mode, paste, press Send/Stop/Allow/Deny, archive); starting a task releases it as soon as Send is pressed, and reading status,
 results and waiting never take it. Tasks are told apart by their own session ids. How many tasks may run at once is a counting limit:
-ZCODE_MAX_PARALLEL (env) or ~/.zcode-bridge/config.json {"max_parallel": N}, default 3, 0 = no limit. `send`/`continue` take a slot (kept in
+ZCODE_MAX_PARALLEL (env) or ~/.zcode-bridge/config.json {"max_parallel": N}, default 3, 0 = no limit. Tasks on the Start Plan's free
+tokens (`--route free` or `--pool free`) also share ZCODE_MAX_PARALLEL_FREE / {"max_parallel_free": N}, default 1: the free plan answers
+429 «user concurrency limit exceeded» past about two requests, and ZCode's own subagents take requests too. `send`/`continue` take a slot (kept in
 ~/.zcode-bridge/slots.json) and wait for one up to --queue-timeout seconds (default 900; 0 = fail at once with parallel_limit); a slot is
 free again when its task is completed, failed or cancelled. `zcbridge slots` shows them.
 """
@@ -720,6 +722,13 @@ def max_parallel():
     except (TypeError, ValueError): return 3
 
 
+def max_parallel_free():
+    v = os.environ.get("ZCODE_MAX_PARALLEL_FREE")
+    if v is None: v = config_value("max_parallel_free")
+    try: return max(0, int(v)) if v is not None else 1
+    except (TypeError, ValueError): return 1
+
+
 @contextlib.contextmanager
 def slots_flock():
     os.makedirs(STATE, exist_ok=True)
@@ -756,19 +765,24 @@ def slots_save(es):
     os.replace(tmp, SLOTS)
 
 
-def slot_acquire(wait_s, label):
-    """Take one of ZCODE_MAX_PARALLEL slots, waiting up to wait_s seconds for a running task to finish (0 = fail at once)."""
+def slot_acquire(wait_s, label, pool=None):
+    """Take one of ZCODE_MAX_PARALLEL slots (and, for pool "free", one of ZCODE_MAX_PARALLEL_FREE), waiting up to wait_s seconds for a
+    running task to finish (0 = fail at once)."""
     end = time.time() + wait_s; tok = uuid.uuid4().hex; told = False
     while True:
-        n = max_parallel()
+        n = max_parallel(); nf = max_parallel_free() if pool == "free" else 0
         with slots_flock():
             es = slots_live()
-            if not n or len(es) < n:
-                es.append(dict(token=tok, pid=os.getpid(), owner_pid=int(os.environ.get("ZCBRIDGE_OWNER_PID") or 0) or None, at=time.time(), label=label, task_id=None)); slots_save(es); return tok
-            held = [e.get("task_id") or e.get("label") for e in es]
+            free = [e for e in es if e.get("pool") == "free"]
+            if (not n or len(es) < n) and (not nf or len(free) < nf):
+                es.append(dict(token=tok, pid=os.getpid(), owner_pid=int(os.environ.get("ZCBRIDGE_OWNER_PID") or 0) or None, at=time.time(), label=label, task_id=None, pool=pool)); slots_save(es); return tok
+            full = (n and len(es) >= n) and es or free
+            held = [e.get("task_id") or e.get("label") for e in full]
+            limit = n if full is es else nf
             slots_save(es)
         if time.time() >= end:
-            raise BridgeError("parallel_limit", "%d of %d ZCode tasks are running (%s); a slot frees when one finishes (limit: ZCODE_MAX_PARALLEL)" % (len(held), n, ", ".join(map(str, held))), running=len(held), limit=n)
+            which = "ZCODE_MAX_PARALLEL" if full is es else "ZCODE_MAX_PARALLEL_FREE, the free plan"
+            raise BridgeError("parallel_limit", "%d of %d ZCode tasks are running (%s); a slot frees when one finishes (limit: %s)" % (len(held), limit, ", ".join(map(str, held)), which), running=len(held), limit=limit, pool=pool)
         if not told: log("%s waits for a slot (%d/%d held)" % (label, len(held), n)); told = True
         time.sleep(min(2.0, max(0.2, end - time.time())))
 
@@ -791,7 +805,7 @@ def slot_release(tok):
 def do_slots(a):
     with slots_flock():
         es = slots_live(); slots_save(es)
-    return dict(ok=True, limit=max_parallel(), held=len(es), slots=[dict(task_id=e.get("task_id"), label=e.get("label"), age_s=int(time.time() - e["at"])) for e in es])
+    return dict(ok=True, limit=max_parallel(), limit_free=max_parallel_free(), held=len(es), held_free=sum(e.get("pool") == "free" for e in es), slots=[dict(task_id=e.get("task_id"), label=e.get("label"), pool=e.get("pool"), age_s=int(time.time() - e["at"])) for e in es])
 
 
 def submit(prompt):
@@ -830,7 +844,7 @@ def do_send(a):
     if a.folder and a.no_create_project and not find_project(a.folder):
         raise BridgeError("project_missing", "%s is not a ZCode project and automatic creation is off (project-add %s)" % (a.folder, a.folder))
     T = {"t0": time.time()}
-    tok = slot_acquire(a.queue_timeout, "send")   # wait for a free slot BEFORE touching the window or its lock
+    tok = slot_acquire(a.queue_timeout, "send", "free" if a.route == "free" or a.pool == "free" else None)   # wait for a free slot BEFORE touching the window or its lock
     T["slot"] = time.time(); bound = False
     try:
         with ui_lock() as prev:   # the lock covers only the window-driving steps, up to the Send press
@@ -913,7 +927,7 @@ def do_continue(a):
         raise BridgeError("task_busy", "task is %s; wait for it or pass --force to queue the follow-up (ZCode setting 'Interaction behavior: Queue')" % st["state"])
     n0 = st["turns"]
     T = {"t0": time.monotonic()}
-    tok = slot_acquire(a.queue_timeout, "continue " + a.task)
+    tok = slot_acquire(a.queue_timeout, "continue " + a.task, a.pool)
     T["slot"] = time.monotonic()
     bound = False
     try:
@@ -1795,6 +1809,7 @@ def main(argv=None):
         p.add_argument("--prompt"); p.add_argument("--prompt-file"); p.add_argument("--wait", action="store_true"); p.add_argument("--timeout", type=int, default=900); p.add_argument("--poll", type=float, default=2.0)
         p.add_argument("--approve", default="deny", choices=["deny", "project", "manual"], help="policy for permission cards while waiting (default deny)")
         p.add_argument("--queue-timeout", type=float, default=float(os.environ.get("ZCBRIDGE_QUEUE_TIMEOUT") or 900), help="seconds to wait for a free parallel slot (ZCODE_MAX_PARALLEL); 0 = fail at once with parallel_limit")
+        p.add_argument("--pool", choices=["free"], help="take a slot of the free plan's own limit too (ZCODE_MAX_PARALLEL_FREE); --route free implies it")
     p = add("send", do_send, help="new task: project folder, model, effort, mode"); sendargs(p)
     p.add_argument("--folder", help="project folder (omit = work outside a project)"); p.add_argument("--model", default="flash"); p.add_argument("--effort", choices=list(EFFORT))
     p.add_argument("--mode", choices=list(MODES), help="ask|plan|auto|full (default: config default_mode, else ask)"); p.add_argument("--allow-autonomous", action="store_true"); p.add_argument("--allow-full", action="store_true")

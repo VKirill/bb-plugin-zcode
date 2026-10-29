@@ -41,6 +41,12 @@ const BRIDGE = process.env.ZCODE_ACP_BRIDGE || [path.join(path.dirname(fs.realpa
 const SESSIONS_FILE = process.env.ZCODE_ACP_SESSIONS || path.join(STATE_DIR, "acp-sessions.json");
 const PROMPT_DIR = path.join(STATE_DIR, "acp-prompts");
 const QUEUE_TIMEOUT_MS = Number(process.env.ZCODE_ACP_QUEUE_TIMEOUT || 900) * 1000;
+// A chat on the free plan waits its turn in the free queue for hours, not 15 minutes: the plan runs one or two tasks at a time.
+const FREE_QUEUE_TIMEOUT_MS = Number(process.env.ZCODE_ACP_FREE_QUEUE_TIMEOUT || 6 * 3600) * 1000;
+// A turn the free plan refused with 429 «user concurrency limit exceeded» is sent again after a pause (2026-10-30: five audit chats
+// failed at once). Delays in seconds; ZCODE_ACP_RATE_RETRY_S="" turns it off.
+const RATE_RETRY_S = (process.env.ZCODE_ACP_RATE_RETRY_S ?? "60,120,240,480,600").split(",").map(Number).filter((n) => n > 0);
+const RATE_RETRY_TEXT = "The previous request hit the plan's concurrency limit and stopped. Continue the task from where it stopped.";
 const PERMISSION_TIMEOUT_MS = Number(process.env.ZCODE_ACP_PERMISSION_TIMEOUT || 600) * 1000;
 const TURN_TIMEOUT_S = Number(process.env.ZCODE_ACP_TURN_TIMEOUT || 14400);
 const AUTOADD = process.env.ZCODE_ACP_AUTOADD !== "0";
@@ -467,12 +473,13 @@ function pidAlive(pid) {
 // cancel is noticed within a fraction of a second and nothing holds the ZCode window while it waits.
 async function runBridgeQueued(s, args, opts = {}) {
   const started = Date.now();
+  const free = sessionRoute(s) === "free";
   let told = false;
   for (;;) {
-    const res = await runBridge([...args, "--queue-timeout", "0"], { timeoutMs: 420000, ...opts });
+    const res = await runBridge([...args, ...(free && args[0] === "continue" ? ["--pool", "free"] : []), "--queue-timeout", "0"], { timeoutMs: 420000, ...opts });
     if (res.ok || res.error?.code !== "parallel_limit") return res;
     if (s.cancelled) throw new AcpError(-32800, "cancelled");
-    if (Date.now() - started > QUEUE_TIMEOUT_MS) {
+    if (Date.now() - started > (free ? FREE_QUEUE_TIMEOUT_MS : QUEUE_TIMEOUT_MS)) {
       throw new AcpError(-32000, `ZCode is already running ${res.error.running ?? "its maximum of"} tasks (limit ${res.error.limit ?? "ZCODE_MAX_PARALLEL"}); try again in a few minutes.`);
     }
     if (!told) {
@@ -481,6 +488,16 @@ async function runBridgeQueued(s, args, opts = {}) {
     }
     for (let i = 0; i < 8 && !s.cancelled; i++) await new Promise((r) => setTimeout(r, 250));
   }
+}
+
+// The plan a session's task runs on: the model it started with (a task keeps it), else the chosen one.
+function sessionRoute(s) {
+  const model = MODELS.find((m) => m.value === (s.firstModel || s.model));
+  return (model && model.route) || ROUTE;
+}
+
+async function pause(s, ms) {
+  for (const end = Date.now() + ms; Date.now() < end && !s.cancelled;) await new Promise((r) => setTimeout(r, Math.min(250, end - Date.now())));
 }
 
 // ---------------------------------------------------------------- prompt rendering and tool mapping
@@ -786,8 +803,18 @@ async function runPrompt(s, params) {
       await ensureCancel(s);
       return { stopReason: "cancelled" };
     }
-    const state = await turn.stream();
-    const status = turn.lastState && Object.hasOwn(turn.lastState, "tokens") ? { ok: true, ...turn.lastState } : await runBridge(["status", s.taskId]);
+    let state = await turn.stream();
+    let status = turn.lastState && Object.hasOwn(turn.lastState, "tokens") ? { ok: true, ...turn.lastState } : await runBridge(["status", s.taskId]);
+    for (let i = 0; state === "error" && !s.cancelled && i < RATE_RETRY_S.length && /model_rate_limited/.test((status.ok && status.error) || ""); i++) {
+      update(s.id, { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: `ZCode: the plan refused the request (${status.error}); sending the task again in ${RATE_RETRY_S[i]} s (${i + 1} of ${RATE_RETRY_S.length}).\n` } });
+      await pause(s, RATE_RETRY_S[i] * 1000);
+      if (s.cancelled) break;
+      await turn.baseline();
+      const res = await withPromptFile(RATE_RETRY_TEXT, (file) => runBridgeQueued(s, ["continue", s.taskId, "--prompt-file", file]));
+      if (!res.ok) throw bridgeError(res);
+      state = await turn.stream();
+      status = turn.lastState && Object.hasOwn(turn.lastState, "tokens") ? { ok: true, ...turn.lastState } : await runBridge(["status", s.taskId]);
+    }
     const tok = status.ok && status.tokens ? status.tokens : null;
     if (tok) update(s.id, { sessionUpdate: "usage_update", used: tok.input ?? 0, size: 1000000, _meta: { zcode: { inputTokens: tok.input ?? 0, cacheReadTokens: tok.cache_read ?? 0, freshInputTokens: Math.max(0, (tok.input ?? 0) - (tok.cache_read ?? 0)), outputTokens: tok.output ?? 0, reasoningTokens: tok.reasoning ?? 0, taskId: s.taskId } } });
     const usage = tok ? { inputTokens: tok.input ?? 0, outputTokens: tok.output ?? 0, thoughtTokens: tok.reasoning ?? 0, cachedReadTokens: tok.cache_read ?? 0, totalTokens: (tok.input ?? 0) + (tok.output ?? 0) } : undefined;

@@ -79,6 +79,8 @@ ZCode's permission cards become BB permission requests ("Allow once" / "Deny"). 
 
 ZCode runs different tasks at once. The bridge holds a counting limit (`ZCODE_MAX_PARALLEL`, default 3, set by the plugin setting) over running ZCode tasks; a slot frees when its task ends or when the `zcode-acp` that holds it is gone. When a BB session ends (closed, stopped, process exit), `zcode-acp` cancels its still-running ZCode task (denies a pending card, presses Stop). `zcbridge slots` shows who holds one.
 
+The Start Plan's free tokens (models marked «· Free») have their own, smaller limit inside it: `ZCODE_MAX_PARALLEL_FREE` or `"max_parallel_free"` in `~/.zcode-bridge/config.json`, default 1. The free plan answers 429 «user concurrency limit exceeded» past about two requests, and ZCode's own subagents take requests too. Free chats wait in this queue for up to 6 hours (`ZCODE_ACP_FREE_QUEUE_TIMEOUT`, seconds). A turn the plan still refuses with `model_rate_limited` is sent again after 1, 2, 4, 8 and 10 minutes (`ZCODE_ACP_RATE_RETRY_S`, empty = off).
+
 ### MCP servers of the chat
 
 The MCP servers BB passes for a thread (for example BB's own `bb-bridge` tools) are merged into `<project>/.zcode/config.json` (`mcp.servers`, names prefixed `bb-`) for the life of the session and removed afterwards. That file may hold BB tokens, so: the file is written `0600`; `.zcode/` is added to the repository's `info/exclude` first (shared by worktrees), so it can never be committed; a `config.json` that git already tracks is left alone; the keys we added (and the file, if we created it) are removed at session end, at process exit, and by the next start after a crash. ZCode reads project-level MCP config per task, so this is the only per-session place; a user-level entry would be shared by all sessions.
@@ -124,7 +126,8 @@ Each turn ends with ACP `usage` and a `usage_update` carrying input, cache-read,
 | `no_window` / `ui_element_missing` for everything | Accessibility is not granted to the program running the bridge, or ZCode is closed. Settings > Privacy & Security > Accessibility. |
 | `session_expired` | Sign in again inside the ZCode app. Never `zcode login`. |
 | `foreground_required` | ZCode did not accept the folder through its link; run `zcbridge project-add DIR --foreground` once while you are away. |
-| `parallel_limit` | `ZCODE_MAX_PARALLEL` tasks are running; wait or raise the setting. |
+| `parallel_limit` | `ZCODE_MAX_PARALLEL` (or, on the free plan, `ZCODE_MAX_PARALLEL_FREE`) tasks are running; wait or raise the setting. |
+| `model_rate_limited` | The plan refused a request for its concurrency limit; a chat sends the turn again by itself. |
 | `busy` / `not_frontmost` | Another bridge command holds the window lock, or (foreground mode) another app has focus: retry. |
 | The provider is missing in BB | `zcode-acp` is not on the host daemon's PATH: set the plugin setting **Agent command** to its full path. |
 | Logs | `~/.zcode-bridge/bridge.log`, `acp.log`, `rewards-attempts.log`. |

@@ -151,6 +151,30 @@ test("a failed ZCode turn is a JSON-RPC error", async () => {
   agent.close();
 });
 
+// 2026-10-30: five audit chats on the free plan failed at once with 429 «user concurrency limit exceeded».
+test("a turn the plan refused for its concurrency limit is sent again after a pause", async () => {
+  const { agent, cwd, calls } = setup({ ZCODE_ACP_RATE_RETRY_S: "0.2,0.2" });
+  await agent.request("initialize", { protocolVersion: 1 });
+  const s = await agent.request("session/new", { cwd, mcpServers: [] });
+  const r = await prompt(agent, s.sessionId, "ratelimit please");
+  assert.equal(r.stopReason, "end_turn");
+  assert.ok(agent.updates.some((u) => u.sessionUpdate === "agent_thought_chunk" && /plan refused the request \(model_rate_limited/.test(u.content.text)));
+  assert.equal(calls().filter((c) => c.startsWith("continue task_")).length, 1);
+  agent.close();
+});
+
+test("a free-plan chat continues its task in the free queue", async () => {
+  const { agent, cwd, calls } = setup();
+  await agent.request("initialize", { protocolVersion: 1 });
+  const s = await agent.request("session/new", { cwd, mcpServers: [] });
+  await agent.request("session/set_config_option", { sessionId: s.sessionId, configId: "model", value: "glm-5.3-flash-free" });
+  await prompt(agent, s.sessionId, "first");
+  await prompt(agent, s.sessionId, "second");
+  assert.ok(calls().some((c) => c.startsWith("send ") && / --route free/.test(c)));
+  assert.ok(calls().some((c) => c.startsWith("continue task_") && / --pool free/.test(c)));
+  agent.close();
+});
+
 function second(a, extraEnv = {}) {
   return startAgent(process.execPath, [agentPath], { HOME: a.dir, ZCODE_ACP_BRIDGE: fakePath, FAKE_ZC_DIR: a.dir, FAKE_ZC_ROOT: fs.realpathSync(a.cwd), ZCODE_ACP_SESSIONS: path.join(a.dir, "sessions.json"), ...extraEnv });
 }

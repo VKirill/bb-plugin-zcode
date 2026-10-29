@@ -25,6 +25,7 @@ function newTurn(prompt) {
     events.push({ event: "tool", id: "call_g", role: "assistant", tool: "Bash", status: "running", input: { command: "echo hi" }, tick: 1 }, { event: "text", id: t, role: "assistant", text: "AB", tick: 1 }, { event: "tool", id: "call_g", role: "assistant", tool: "Bash", status: "completed", input: { command: "echo hi" }, output: "hi", tick: 3 }, { event: "text", id: t, role: "assistant", text: "ABCD", delta: "CD", tick: 3 }, { event: "text", id: t, role: "assistant", text: "ABCDEF", delta: "EF", tick: 5 });
     return { events, state, pending };
   }
+  if (prompt.includes("ratelimit")) return { events, state: "error", pending, error: "model_rate_limited: user concurrency limit exceeded" };
   if (prompt.includes("fail")) state = "error";
   else if (prompt.includes("slow")) state = "running";
   else if (prompt.includes("approve")) { state = "waiting_approval"; pending = { call_id: "call_1", tool: "Write", input: { file_path: "/tmp/x.txt", content: "hi" } }; }
@@ -44,7 +45,7 @@ if (cmd === "mode-reset" || cmd === "project-remove") out({ ok: true });
 if (cmd === "projects") out({ ok: true, projects: [{ id: "p", name: "p", roots: [process.env.FAKE_ZC_ROOT || "/"] }] });
 if (cmd === "send") { limitCheck(); const t = "task_" + Date.now() + "_" + Math.random().toString(36).slice(2, 7); save(t, { turns: [newTurn(promptOf())], cwd: flag("--folder"), model: flag("--model"), effort: flag("--effort") }); out({ ok: true, task_id: t, project_created: process.env.FAKE_ZC_CREATED === "1" }); }
 if (cmd === "continue") { limitCheck(); const t = rest[0]; const d = load(t); d.turns.push(newTurn(promptOf())); save(t, d); out({ ok: true, task_id: t }); }
-if (cmd === "status") { const d = load(rest[0]); const tu = d.turns.at(-1); out({ ok: true, state: d.cancelled ? "cancelled" : tu.state, tokens: { input: 10, output: 2, reasoning: 1, cache_read: 0 }, error: tu.state === "error" ? "boom" : null }); }
+if (cmd === "status") { const d = load(rest[0]); const tu = d.turns.at(-1); out({ ok: true, state: d.cancelled ? "cancelled" : tu.state, tokens: { input: 10, output: 2, reasoning: 1, cache_read: 0 }, error: tu.state === "error" ? tu.error || "boom" : null }); }
 if (cmd === "result") out({ ok: true, answer: "RESULT" });
 if (cmd === "approvals") { const d = load(rest[0]); const tu = d.turns.at(-1); out({ ok: true, pending: tu.pending ? [tu.pending] : [] }); }
 if (cmd === "approve" || cmd === "deny") {
@@ -61,7 +62,7 @@ if (cmd === "watch") {
     all.forEach((e, i) => { if (!sent.has(i) && (e.tick || 0) <= polls) { sent.add(i); const { tick: _t, delta: _d, ...ev } = e; console.log(JSON.stringify(ev)); } });
     const tu = d.turns.at(-1); let state = d.cancelled ? "cancelled" : tu.state;
     if (sent.size < all.length && state === "completed") state = "running";
-    if (["completed", "error", "cancelled", "waiting_approval"].includes(state) || Date.now() > end) { console.log(JSON.stringify({ event: "state", state, pending_approvals: tu.pending ? [tu.pending] : [], tokens: { input: 10, output: 2, reasoning: 1, cache_read: 0 }, error: state === "error" ? "boom" : null })); process.exit(0); }
+    if (["completed", "error", "cancelled", "waiting_approval"].includes(state) || Date.now() > end) { console.log(JSON.stringify({ event: "state", state, pending_approvals: tu.pending ? [tu.pending] : [], tokens: { input: 10, output: 2, reasoning: 1, cache_read: 0 }, error: state === "error" ? tu.error || "boom" : null })); process.exit(0); }
     setTimeout(tick, 100);
   };
   tick();
