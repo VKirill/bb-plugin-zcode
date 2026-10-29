@@ -344,6 +344,15 @@ def pending(sid):
     return res
 
 
+def turn_error(c, sid, code):
+    """The model error behind a failed turn: turn_usage keeps only UNKNOWN_ERROR, the last assistant message keeps the provider's
+    code and text (2026-10-30: «user concurrency limit exceeded», 429 of the Start Plan, showed up as UNKNOWN_ERROR)."""
+    row = c.execute("select data from message where session_id=? and json_extract(data,'$.role')='assistant' and json_extract(data,'$.error') is not null order by time_created desc limit 1", (sid,)).fetchone()
+    data = ((json.loads(row["data"]) if row else {}).get("error") or {}).get("data") or {}
+    detail = ": ".join(str(x) for x in (data.get("code"), data.get("message")) if x)
+    return detail or code
+
+
 def task_state(sid):
     c = conn(DBP); s = session_row(sid)
     users = user_messages(c, sid)
@@ -360,7 +369,7 @@ def task_state(sid):
     else: state = "running" if c.execute("select count(*) from part where session_id=? and time_created>?", (sid, users[-1][1])).fetchone()[0] else "starting"
     out = dict(task_id=sid, state=state, title=s["title"], directory=s["directory"], turns=len(users), archived=bool(s["time_archived"]))
     if t is not None:
-        out.update(error=t["error_code"] if t["status"] == "error" else None, cancelled_by_user=bool(t["cancelled_by_user"]), duration_ms=t["duration_ms"], tool_calls=t["tool_call_count"],
+        out.update(error=turn_error(c, sid, t["error_code"]) if t["status"] == "error" else None, cancelled_by_user=bool(t["cancelled_by_user"]), duration_ms=t["duration_ms"], tool_calls=t["tool_call_count"],
                    tokens=dict(input=t["input_tokens"], output=t["output_tokens"], reasoning=t["reasoning_tokens"], cache_read=t["cache_read_input_tokens"]))
     if pend: out["pending_approvals"] = pend
     return out
