@@ -36,6 +36,10 @@ if (process.env.FAKE_ZCODE_FAIL === "model") {
   process.stderr.write("Select a model before sending a message\n");
   process.exit(1);
 }
+if (process.env.FAKE_ZCODE_LEAK) {
+  process.stderr.write(process.env.FAKE_ZCODE_LEAK + "\n");
+  process.exit(1);
+}
 const sleepMs = Number(process.env.FAKE_ZCODE_SLEEP_MS || 0);
 if (sleepMs > 0) await new Promise((r) => setTimeout(r, sleepMs));
 const sessionId = process.env.FAKE_ZCODE_SESSION_ID || "sess_fake_1";
@@ -50,6 +54,10 @@ const payload = {
     cacheReadTokens: Number(process.env.FAKE_ZCODE_CACHE || 3),
   },
 };
+if (process.env.FAKE_ZCODE_QUOTA === "1") {
+  payload.providerCode = 1005;
+  payload.response = "ProviderBusinessError: exceed quota limit";
+}
 if (process.env.FAKE_ZCODE_PRETTY === "1") {
   process.stdout.write("ZCode Built-in skipped (not-due)\n" + JSON.stringify(payload, null, 2) + "\n");
 } else {

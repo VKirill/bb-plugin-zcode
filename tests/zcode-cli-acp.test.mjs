@@ -188,3 +188,62 @@ test("set-key writes encrypted credentials per model and never prints the dummy 
 test("launcher exists next to the agent", () => {
   assert.equal(fs.existsSync(launcherPath), true);
 });
+
+// A value encrypted the way ZCode and set-key encrypt credentials (AES-256-GCM, fallback key of platform + HOME + user).
+function encValue(plain, key) {
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
+  const ct = Buffer.concat([cipher.update(plain, "utf8"), cipher.final()]);
+  return `enc:v1:${iv.toString("base64url")}.${cipher.getAuthTag().toString("base64url")}.${ct.toString("base64url")}`;
+}
+function credentialKeyOf(dir) {
+  return crypto.createHash("sha256").update(`zcode-credential-fallback:${os.platform()}:${dir}:${os.userInfo().username}`).digest();
+}
+// The stores a GLM-5.3-Flash-Free turn needs: the app's zcodejwttoken and the Coding Plan key of the GLM-5.3-Flash key store.
+function seedFreeStores(dir, { appToken = true, key = true } = {}) {
+  const credentialKey = credentialKeyOf(dir);
+  if (appToken) {
+    fs.mkdirSync(path.join(dir, ".zcode", "v2"), { recursive: true });
+    fs.writeFileSync(path.join(dir, ".zcode", "v2", "credentials.json"), JSON.stringify({ zcodejwttoken: encValue("dummy-app-jwt-not-real", credentialKey) }));
+  }
+  if (key) {
+    const v2 = path.join(dir, "cli-home", "GLM-5.3-Flash", ".zcode", "v2");
+    fs.mkdirSync(v2, { recursive: true });
+    fs.writeFileSync(path.join(v2, "credentials.json"), JSON.stringify({ "account-provider:coding-plan:account:acc:api-key": encValue("dummyid.dummysecret", credentialKey) }), { mode: 0o600 });
+  }
+}
+
+test("a turn on GLM-5.3-Flash-Free writes the Start Plan provider_config (0600) into <CLI_HOME>/start-plan", async () => {
+  const { agent, cwd, dir, turns } = setup();
+  seedFreeStores(dir);
+  try {
+    await agent.request("initialize", { protocolVersion: 1 });
+    const s = await agent.request("session/new", { cwd, mcpServers: [] });
+    await agent.request("session/set_config_option", { sessionId: s.sessionId, configId: "model", value: "GLM-5.3-Flash-Free" });
+    const r = await prompt(agent, s.sessionId, "free turn");
+    assert.equal(r.stopReason, "end_turn");
+    assert.equal(text(agent.updates), "fake-response");
+    assert.equal(turns()[0].env.ZCODE_DATA_BASE_DIR, path.join(dir, "cli-home", "start-plan"));
+    const configFile = path.join(dir, "cli-home", "start-plan", ".zcode", "v2", "provider_config.json");
+    const blob = fs.readFileSync(configFile, "utf8");
+    assert.ok(blob.includes("https://zcode.z.ai/api/v1/zcode-plan/anthropic"), "the Start Plan endpoint");
+    assert.ok(blob.includes("Bearer dummy-app-jwt-not-real"), "the app token as the Authorization header");
+    assert.ok(blob.includes("dummyid.dummysecret"), "the Coding Plan key signs the requests");
+    assert.equal(fs.statSync(configFile).mode & 0o077, 0, "provider_config.json is private (0600)");
+  } finally {
+    agent.close();
+  }
+});
+
+test("a GLM-5.3-Flash-Free turn without a readable app token fails naming the missing piece", async () => {
+  const { agent, cwd, dir } = setup();
+  seedFreeStores(dir, { appToken: false });
+  try {
+    await agent.request("initialize", { protocolVersion: 1 });
+    const s = await agent.request("session/new", { cwd, mcpServers: [] });
+    await agent.request("session/set_config_option", { sessionId: s.sessionId, configId: "model", value: "GLM-5.3-Flash-Free" });
+    await assert.rejects(prompt(agent, s.sessionId, "free turn"), /zcodejwttoken/);
+  } finally {
+    agent.close();
+  }
+});

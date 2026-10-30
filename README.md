@@ -54,7 +54,7 @@ The model list in BB is built from the models **your** ZCode offers (enabled one
 
 BB shows **one** ZCode provider; picking the model picks who pays:
 
-- **«· Free»** (e.g. `GLM-5.3-Flash · Free`) runs only on the Start Plan's free tokens, through the ZCode window (`zcbridge … --route free`).
+- **«· Free»** (e.g. `GLM-5.3-Flash · Free`) runs on the Start Plan's free tokens — headless through the ZCode CLI when the app is signed in (its `zcodejwttoken` is readable) and the Coding Plan key is stored below, otherwise through the ZCode window (`zcbridge … --route free`). The CLI turn signs in with a `provider_config.json` written into `~/.zcode-bridge/cli-home/start-plan/.zcode/v2/` (mode 0600): the Start Plan endpoint `https://zcode.z.ai/api/v1/zcode-plan/anthropic`, `Authorization: Bearer <zcodejwttoken>` and the Coding Plan key. Outside the promo hours the CLI reports `providerCode 1005` / `exceed quota limit`; the turn then fails with an error naming the Start Plan quota.
 - **«· Paid»** (`GLM-5.3-Flash · Paid`, `GLM-5.3 · Paid`) runs on your Coding Plan through ZCode's bundled CLI, headless. It needs the Coding Plan API key once:
 
 ```sh
@@ -62,10 +62,10 @@ zcode-cli-acp set-key   # paste the key, then Ctrl-D
 zcode-cli-acp status
 ```
 
-  The key is stored under `~/.zcode-bridge/cli-home/<model>/.zcode/v2/` (encrypted, mode 0600) and is never printed; `~/.zcode/v2` (the desktop app's sign-in) is never read or written. The `zcode-acp` agent starts a `zcode-cli-acp` child ACP agent for the paid turns and relays its stream, permission requests, usage and results; the desktop app itself is not driven on this path.
+  The key is stored under `~/.zcode-bridge/cli-home/<model>/.zcode/v2/` (encrypted, mode 0600) and is never printed. The `zcode-acp` agent starts a `zcode-cli-acp` child ACP agent for the headless turns (free and paid) and relays its stream, permission requests, usage and results; the desktop app itself is not driven on this path — it may stay minimized. The app's `zcodejwttoken` is read (decrypted in place, never written back, never logged): it appears only inside the free data dir's `provider_config.json`, and every error message, session update and log line is redacted so the token and the key never reach the client or the logs.
 - **Without a stored key** the paid models keep their plain names (`GLM-5.3-Flash`, `GLM-5.3`) and run on your Z.ai plan through the window (Flash with `--route plan`), as before.
 
-Each backend keeps its own conversation: switching a chat between a «· Free» and a «· Paid» model starts a fresh conversation on the other backend (window task and CLI conversation are not carried over). The model ids in BB never change: `glm-5.3-flash`, `glm-5.3-flash-free`, `glm-5.3`.
+Each backend keeps its own conversation: switching a chat between tariffs (free ⇄ paid, window ⇄ CLI) starts a fresh conversation on the new backend (conversations are not carried over). The model ids in BB never change: `glm-5.3-flash`, `glm-5.3-flash-free`, `glm-5.3`.
 
 ## How it works
 
@@ -129,7 +129,7 @@ Each turn ends with ACP `usage` and a `usage_update` carrying input, cache-read,
 
 ## The zcode-cli-acp command
 
-`zcode-cli-acp` is the paid backend's own command (installed next to `zcode-acp`): `set-key` stores the Coding Plan API key (stdin), `status` reports whether the CLI entry and the key are found. It is also a standalone ACP stdio agent — BB does not pick it as a provider anymore, `zcode-acp` runs it as a child agent for «· Paid» turns. The desktop app stays signed in; this path never reads or writes `~/.zcode/v2`.
+`zcode-cli-acp` is the headless backend's own command (installed next to `zcode-acp`): `set-key` stores the Coding Plan API key (stdin), `status` reports whether the CLI entry and the key are found. It is also a standalone ACP stdio agent — BB does not pick it as a provider anymore, `zcode-acp` runs it as a child agent for the headless «· Paid» and «· Free» turns. The desktop app stays signed in; its `zcodejwttoken` is read in place for the Start Plan turns and never written.
 
 ## Limits
 
@@ -170,7 +170,7 @@ Apache-2.0, see [LICENSE](LICENSE). ZCode and Z.ai are trademarks of their owner
 
 # По-русски
 
-**ZCode как провайдер BB.** Выберите «ZCode» в чате BB, и задача выполнится на GLM-5.3-Flash / GLM-5.3 на вашем Mac, тариф виден в имени модели: **«· Free»** работает на бесплатных токенах стартового тарифа через окно приложения [ZCode](https://zcode.z.ai), **«· Paid»** — на вашем Coding Plan через встроенный CLI ZCode (без окна). В BB виден потоковый ответ, карточки инструментов и запросы разрешений, как у любого провайдера.
+**ZCode как провайдер BB.** Выберите «ZCode» в чате BB, и задача выполнится на GLM-5.3-Flash / GLM-5.3 на вашем Mac, тариф виден в имени модели: **«· Free»** работает на бесплатных токенах стартового тарифа — без окна, через встроенный CLI ZCode, когда выполнен вход в приложение (его `zcodejwttoken` читается) и сохранён ключ Coding Plan, иначе через окно приложения [ZCode](https://zcode.z.ai); **«· Paid»** — на вашем Coding Plan через встроенный CLI ZCode (без окна). В BB виден потоковый ответ, карточки инструментов и запросы разрешений, как у любого провайдера.
 
 У ZCode нет публичного API, поэтому маленький мост (`zcbridge`) управляет окном приложения через доступность macOS (Accessibility) и читает результаты из локальной базы ZCode (только чтение). Токены не извлекаются, к серверам Z.ai проект не обращается, внутри `ZCode.app` ничего не меняется.
 
@@ -190,7 +190,7 @@ Apache-2.0, see [LICENSE](LICENSE). ZCode and Z.ai are trademarks of their owner
 
 В BB **один** провайдер ZCode; выбор модели выбирает, кто платит:
 
-- **«· Free»** (например, `GLM-5.3-Flash · Free`) работает только на бесплатных токенах стартового тарифа (Start Plan), через окно ZCode (`zcbridge … --route free`).
+- **«· Free»** (например, `GLM-5.3-Flash · Free`) работает на бесплатных токенах стартового тарифа (Start Plan) — без окна, через CLI ZCode, когда вход в приложение выполнен (его `zcodejwttoken` читается) и сохранён ключ Coding Plan; иначе через окно ZCode (`zcbridge … --route free`). Для такого хода в `~/.zcode-bridge/cli-home/start-plan/.zcode/v2/provider_config.json` (права 0600) пишется конфиг стартового тарифа: endpoint `https://zcode.z.ai/api/v1/zcode-plan/anthropic`, `Authorization: Bearer <zcodejwttoken>` и ключ Coding Plan. Вне промо-часов CLI отвечает `providerCode 1005` / `exceed quota limit`; ход завершается ошибкой, которая называет квоту Start Plan.
 - **«· Paid»** (`GLM-5.3-Flash · Paid`, `GLM-5.3 · Paid`) работает на вашем Coding Plan через встроенный CLI ZCode, без окна. Нужен ключ Coding Plan (один раз):
 
 ```sh
@@ -198,14 +198,14 @@ zcode-cli-acp set-key   # вставьте ключ, затем Ctrl-D
 zcode-cli-acp status
 ```
 
-  Ключ лежит в `~/.zcode-bridge/cli-home/<модель>/.zcode/v2/` (шифруется, права 0600) и в вывод не попадает; `~/.zcode/v2` (вход десктопного приложения) не читается и не пишется. Агент `zcode-acp` запускает для платных ходов дочернего ACP-агента `zcode-cli-acp` и передаёт его поток, запросы разрешений, токены и результат; само десктопное приложение на этом пути не управляется.
+  Ключ лежит в `~/.zcode-bridge/cli-home/<модель>/.zcode/v2/` (шифруется, права 0600) и в вывод не попадает. Агент `zcode-acp` запускает для оконных обходов дочернего ACP-агента `zcode-cli-acp` (платные и бесплатные ходы) и передаёт его поток, запросы разрешений, токены и результат; само десктопное приложение на этом пути не управляется — его можно держать свёрнутым. `zcodejwttoken` приложения читается (расшифровывается на месте, не перезаписывается и не логируется): он попадает только в `provider_config.json` папки start-plan, а все ошибки, обновления сессии и строки логов очищаются, чтобы токен и ключ не попали к клиенту и в логи.
 - **Без сохранённого ключа** платные модели сохраняют прежние имена (`GLM-5.3-Flash`, `GLM-5.3`) и работают на вашем тарифе Z.ai через окно (Flash с `--route plan`), как раньше.
 
-У каждого бэкенда свой разговор: переключение чата между «· Free» и «· Paid» моделью начинает новый разговор на другом бэкенде (задача окна и разговор CLI друг в друга не переносятся). Идентификаторы моделей в BB не меняются: `glm-5.3-flash`, `glm-5.3-flash-free`, `glm-5.3`.
+У каждого бэкенда свой разговор: переключение чата между тарифами (free ⇄ paid, окно ⇄ CLI) начинает новый разговор на новом бэкенде (разговоры друг в друга не переносятся). Идентификаторы моделей в BB не меняются: `glm-5.3-flash`, `glm-5.3-flash-free`, `glm-5.3`.
 
 ## Команда zcode-cli-acp
 
-`zcode-cli-acp` — команда платного бэкенда (ставится рядом с `zcode-acp`): `set-key` сохраняет ключ Coding Plan (stdin), `status` показывает, найдены ли CLI и ключ. Это также самостоятельный ACP-агент для stdio — BB больше не показывает его отдельным провайдером, `zcode-acp` запускает его дочерним процессом для платных ходов. Десктопное приложение остаётся в сессии; `~/.zcode/v2` не читается и не пишется.
+`zcode-cli-acp` — команда головного бэкенда (ставится рядом с `zcode-acp`): `set-key` сохраняет ключ Coding Plan (stdin), `status` показывает, найдены ли CLI и ключ. Это также самостоятельный ACP-агент для stdio — BB больше не показывает его отдельным провайдером, `zcode-acp` запускает его дочерним процессом для ходов «· Paid» и «· Free». Десктопное приложение остаётся в сессии; его `zcodejwttoken` читается на месте для ходов Start Plan и не перезаписывается.
 
 **Ограничения:** это управление через интерфейс, обновление ZCode может сломать шаг; нужен разблокированный экран и не спящий Mac; каждая задача ZCode стоит около 40k входных токенов; ответ приходит по шагам модели, а не по токенам.
 

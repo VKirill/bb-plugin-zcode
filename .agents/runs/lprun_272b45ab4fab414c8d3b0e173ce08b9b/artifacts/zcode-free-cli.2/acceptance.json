@@ -1,0 +1,15 @@
+{
+  "schema_version": 2,
+  "task_id": "zcode-free-cli.2",
+  "task_sha256": "f26064f72287369883fb6fe05ca1b66a1dec8d34c1907e150bae32a00abdc613",
+  "attempt": 1,
+  "provider_exit": 0,
+  "report": "complete",
+  "report_sha256": "0fd6fb6f67b013fd1c6ddd13295ba106f9f6a8398b1553b0a14d25e5af94ddb0",
+  "owns_check": "passed",
+  "verification": "passed",
+  "review": "passed",
+  "accepted": true,
+  "accepted_at": "2026-10-30T13:12:17.878Z",
+  "model": "zai-coding-plan/glm-5.3-flash"
+}

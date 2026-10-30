@@ -18,9 +18,18 @@ const SESSIONS_FILE = process.env.ZCODE_CLI_ACP_SESSIONS || path.join(STATE_DIR,
 const ATTACH_LIMIT = 16000;
 const PLAN = "zai-individual-coding-plan";
 const PROVIDER_ID = `account:${PLAN}`;
+// The Start Plan (the «· Free» tariff) runs headless on zcode.z.ai with the desktop app's own zcodejwttoken as the Authorization
+// header and the Coding Plan key as access.apiKey. Its data dir is <CLI_HOME>/start-plan; provider_config.json is written there
+// before every free turn (mode 0600) from a freshly read token and key.
+const FREE_MODEL = "GLM-5.3-Flash-Free";
+const FREE_KEY_STORE = "GLM-5.3-Flash";
+const APP_CREDENTIALS = process.env.ZCODE_APP_CREDENTIALS || path.join(HOME, ".zcode", "v2", "credentials.json");
+const START_PLAN_BASE_URL = "https://zcode.z.ai/api/v1/zcode-plan/anthropic";
+const SECRETS = new Set();
 const MODELS = [
   { value: "GLM-5.3-Flash", name: "GLM-5.3-Flash" },
   { value: "GLM-5.3", name: "GLM-5.3" },
+  { value: FREE_MODEL, name: "GLM-5.3-Flash · Free" },
 ];
 const DEFAULT_MODEL = "GLM-5.3-Flash";
 const MODE_CLI = { full: "yolo", auto: "guarded", ask: "edit", plan: "plan" };
@@ -33,11 +42,16 @@ const KEY_ERROR = "Authentication required: run `zcode-cli-acp set-key` with you
 
 const sessions = new Map();
 
+function redact(text) {
+  let t = String(text ?? "");
+  for (const secret of SECRETS) if (secret) t = t.split(secret).join("<redacted>");
+  return t.replace(/Bearer \S+/g, "Bearer <redacted>");
+}
 function send(message) {
   process.stdout.write(JSON.stringify({ jsonrpc: "2.0", ...message }) + "\n");
 }
 function log(...parts) {
-  const line = `${new Date().toISOString()} ${parts.join(" ")}`;
+  const line = `${new Date().toISOString()} ${parts.map(redact).join(" ")}`;
   process.stderr.write(line + "\n");
   try {
     fs.mkdirSync(STATE_DIR, { recursive: true });
@@ -45,6 +59,7 @@ function log(...parts) {
   } catch {}
 }
 function update(sessionId, upd) {
+  if (upd && upd.content && typeof upd.content.text === "string") upd = { ...upd, content: { ...upd.content, text: redact(upd.content.text) } };
   send({ method: "session/update", params: { sessionId, update: upd } });
 }
 class AcpError extends Error {
@@ -63,6 +78,61 @@ function encryptValue(plain, key) {
   const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
   const ct = Buffer.concat([cipher.update(String(plain), "utf8"), cipher.final()]);
   return `enc:v1:${iv.toString("base64url")}.${cipher.getAuthTag().toString("base64url")}.${ct.toString("base64url")}`;
+}
+function decryptValue(encoded, key = credentialKey()) {
+  try {
+    const body = String(encoded);
+    if (!body.startsWith("enc:v1:")) return null;
+    const [ivB, tagB, ctB] = body.slice("enc:v1:".length).split(".");
+    if (!ivB || !tagB || !ctB) return null;
+    const decipher = crypto.createDecipheriv("aes-256-gcm", key, Buffer.from(ivB, "base64url"));
+    decipher.setAuthTag(Buffer.from(tagB, "base64url"));
+    const plain = Buffer.concat([decipher.update(Buffer.from(ctB, "base64url")), decipher.final()]).toString("utf8");
+    return plain.length ? plain : null;
+  } catch {
+    return null;
+  }
+}
+// The desktop app's own token: entry `zcodejwttoken` of ~/.zcode/v2/credentials.json (encrypted the same way). Read fresh before
+// every free turn; null on any error (missing file, missing entry, bad JSON, failed decrypt) — never throws, never logged.
+function readAppToken() {
+  try {
+    const creds = JSON.parse(fs.readFileSync(APP_CREDENTIALS, "utf8"));
+    const token = decryptValue(creds?.zcodejwttoken);
+    return token ? token.trim() || null : null;
+  } catch {
+    return null;
+  }
+}
+// The Coding Plan API key set-key stored for a model (the encrypted `...:api-key` entry of its key store).
+function readStoredKey(modelId) {
+  try {
+    const creds = JSON.parse(fs.readFileSync(path.join(CLI_HOME, modelId, ".zcode", "v2", "credentials.json"), "utf8"));
+    for (const [k, v] of Object.entries(creds)) if (k.includes("api-key")) { const key = decryptValue(v); if (key) return key; }
+    return null;
+  } catch {
+    return null;
+  }
+}
+function startPlanConfig(token, apiKey) {
+  return {
+    schemaVersion: 1,
+    config: {
+      providerConfigRules: {
+        providerRules: [{
+          providerId: "bb-start-plan",
+          config: {
+            group: "standard-personal",
+            personalModelIds: ["GLM-5.3-Flash"],
+            api: { type: "anthropic-messages", baseUrl: START_PLAN_BASE_URL, headers: { Authorization: `Bearer ${token}` } },
+            access: { type: "api-key", apiKey },
+          },
+        }],
+      },
+      modelConfigRules: { providerModelRules: [], manualProviderModelRules: [] },
+      defaultModelSelection: { providerId: "bb-start-plan", modelId: "GLM-5.3-Flash" },
+    },
+  };
 }
 function providerConfig(modelId) {
   return {
@@ -84,6 +154,7 @@ function writeKeyStore(apiKey) {
     [`account-provider:coding-plan:${PROVIDER_ID}:account:${encoded}:api-key`]: apiKey,
   };
   for (const model of MODELS) {
+    if (model.value === FREE_MODEL) continue; // the free model runs on the Start Plan provider; it keeps no Coding Plan key store
     const dir = path.join(CLI_HOME, model.value, ".zcode", "v2");
     fs.mkdirSync(dir, { recursive: true });
     const creds = Object.fromEntries(Object.entries(entries).map(([k, v]) => [k, encryptValue(v, key)]));
@@ -452,17 +523,35 @@ function parseJsonResult(out) {
   return null;
 }
 
-function cliEnv(model) {
+function cliEnv(model, dataDir) {
   return {
     ...process.env,
     HOME,
-    ZCODE_DATA_BASE_DIR: path.join(CLI_HOME, model),
+    ZCODE_DATA_BASE_DIR: dataDir || path.join(CLI_HOME, model),
     ZCODE_BUILTIN_PROVIDER_CONFIG_FILE: BUILTIN_CONFIG,
   };
 }
 
 function runTurn(s, promptText) {
   const model = MODELS.some((m) => m.value === s.model) ? s.model : DEFAULT_MODEL;
+  const free = model === FREE_MODEL;
+  let dataDir = null;
+  if (free) {
+    // The Start Plan turn is authorized with the app's own zcodejwttoken (Authorization header) and signed with the Coding Plan
+    // key; both are read fresh and go into the data dir's provider_config.json (0600) right before the CLI runs.
+    const token = readAppToken();
+    const apiKey = readStoredKey(FREE_KEY_STORE);
+    if (!token) throw new AcpError(-32000, redact(`the desktop app's zcodejwttoken (${APP_CREDENTIALS}) is missing or undecryptable; sign in inside the ZCode app or run this turn through the window`));
+    if (!apiKey) throw new AcpError(-32000, redact(`the Coding Plan API key for ${FREE_KEY_STORE} is not stored; run \`zcode-cli-acp set-key\`, or run this turn through the window`));
+    SECRETS.add(token);
+    SECRETS.add(apiKey);
+    dataDir = path.join(CLI_HOME, "start-plan");
+    const v2 = path.join(dataDir, ".zcode", "v2");
+    fs.mkdirSync(v2, { recursive: true });
+    const config = path.join(v2, "provider_config.json");
+    fs.writeFileSync(config, JSON.stringify(startPlanConfig(token, apiKey)) + "\n", { mode: 0o600 });
+    fs.chmodSync(config, 0o600);
+  }
   const mode = MODE_CLI[effectiveMode()] || "yolo";
   const args = ["-p", promptText, "--json", "--mode", mode, "--cwd", s.cwd];
   let attachFile = null;
@@ -473,7 +562,7 @@ function runTurn(s, promptText) {
     args.push("--attach", attachFile);
   }
   if (s.zcodeSessionId) args.push("--resume", s.zcodeSessionId);
-  const child = spawn(process.execPath, [CLI_ENTRY, ...args], { env: cliEnv(model), stdio: ["ignore", "pipe", "pipe"] });
+  const child = spawn(process.execPath, [CLI_ENTRY, ...args], { env: cliEnv(model, dataDir), stdio: ["ignore", "pipe", "pipe"] });
   s.active = { child, attachFile };
   let stdout = "";
   let stderr = "";
@@ -491,17 +580,20 @@ function runTurn(s, promptText) {
       s.active = null;
       fn();
     };
-    child.on("error", (e) => finish(() => reject(new AcpError(-32603, `zcode CLI: ${e.message}`))));
+    child.on("error", (e) => finish(() => reject(new AcpError(-32603, redact(`zcode CLI: ${e.message}`)))));
     child.on("close", (code) => {
       finish(() => {
         const json = parseJsonResult(stdout);
         if (s.cancelled && !json) return resolve({ cancelled: true });
+        if (free && (json?.providerCode === 1005 || /exceed quota limit/i.test(stdout))) {
+          return reject(new AcpError(-32000, redact("the Start Plan's free quota is used up or outside its hours (providerCode 1005, exceed quota limit); try again in the promo hours or run this turn through the window")));
+        }
         if (!s.cancelled && (code !== 0 || /project_token_login_failed|Select a model/.test(stderr))) {
-          return reject(new AcpError(-32000, `${KEY_ERROR} (${(stderr || stdout || `exit ${code}`).trim().slice(-200)})`));
+          return reject(new AcpError(-32000, redact(`${KEY_ERROR} (${(stderr || stdout || `exit ${code}`).trim().slice(-200)})`)));
         }
         if (!json) {
           if (s.cancelled) return resolve({ cancelled: true });
-          return reject(new AcpError(-32603, `ZCode CLI produced no JSON: ${(stderr || stdout).trim().slice(-300)}`));
+          return reject(new AcpError(-32603, redact(`ZCode CLI produced no JSON: ${(stderr || stdout).trim().slice(-300)}`)));
         }
         resolve({ json });
       });
@@ -617,7 +709,7 @@ rl.on("line", (line) => {
     (result) => send({ id: msg.id, result: result ?? {} }),
     (e) => {
       log("error in", msg.method, String(e?.message || e));
-      send({ id: msg.id, error: { code: e instanceof AcpError ? e.code : -32603, message: String(e?.message || e) } });
+      send({ id: msg.id, error: { code: e instanceof AcpError ? e.code : -32603, message: redact(String(e?.message || e)) } });
     },
   );
 });
