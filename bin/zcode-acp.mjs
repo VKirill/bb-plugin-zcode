@@ -4,6 +4,8 @@
 //   session/new       remembers cwd (the ZCode task is created lazily, on the first prompt)
 //   session/prompt    first turn `zcbridge send`, later turns `zcbridge continue`; then `zcbridge watch` is turned into
 //                     session/update events; permission cards become session/request_permission (allow once / deny)
+//   paid models       a «· Paid» model (its Coding Plan key is stored and the ZCode CLI supports it) runs in a `zcode-cli-acp.mjs`
+//                     child ACP agent instead of the window; free models, and paid models without a stored key, use the window
 //   session/cancel    `zcbridge cancel` (Stop through accessibility, a pending permission card denied first; a few seconds)
 //   mcpServers        the servers BB passes in session/new / session/load are merged into <cwd>/.zcode/config.json (`mcp.servers`,
 //                     names prefixed `bb-`) and taken out again when the session or the process ends; the project's own entries stay
@@ -21,6 +23,9 @@
 //   ZCODE_ROUTE              keep|auto|plan|promo: which plan pays for a task of a model without its own route (see `zcbridge route`)
 //   Free models              every Flash model is offered twice: «GLM-5.3-Flash» runs on the owner's Z.ai plan, «GLM-5.3-Flash · Free»
 //                            (id <model>-free) on the Start Plan's free tokens or not at all (`zcbridge send --route free`)
+//   Paid models              with a Coding Plan key stored (`zcode-cli-acp set-key`) the models the ZCode CLI supports (GLM-5.3-Flash,
+//                            GLM-5.3) are named «· Paid» and their turns run through the CLI; without a key they keep their plain names
+//                            and run on the plan through the window (`zcbridge send --route plan`), as on the base
 //   ZCODE_ACP_REMOVE_PREFIXES  folders (colon or newline separated, ~ allowed) whose auto-registered projects are removed from ZCode's
 //                            list when the session ends (default ~/.lane-pilot/worktrees)
 //   ZCODE_ACP_AUTOADD=0      do not register unknown folders as ZCode projects
@@ -64,28 +69,44 @@ const MODELS_MAX_AGE_MS = 24 * 3600 * 1000;
 // The models BB offers are the ones this machine's ZCode offers: `zcbridge models` reads its Model settings (enabled switches) and its
 // composer default, and caches the answer in ~/.zcode-bridge/models.json; a stale or missing cache is refreshed in the background.
 const slug = (name) => name.toLowerCase().replace(/[^a-z0-9.]+/g, "-").replace(/^-+|-+$/g, "");
-const FALLBACK_MODELS = [{ value: "glm-5.3-flash", name: "GLM-5.3-Flash", bridge: "GLM-5.3-Flash" }];
+const FALLBACK_MODELS = [
+  { value: "glm-5.3-flash", name: "GLM-5.3-Flash", bridge: "GLM-5.3-Flash" },
+  { value: "glm-5.3", name: "GLM-5.3", bridge: "GLM-5.3" },
+];
+// The paid backend is the ZCode CLI (bin/zcode-cli-acp.mjs), signed in with the Coding Plan API key that `zcode-cli-acp set-key`
+// stores under CLI_HOME/<model>/.zcode/v2/credentials.json; it runs exactly these bridge model names.
+const CLI_MODELS = new Set(["GLM-5.3-Flash", "GLM-5.3"]);
+const CLI_HOME = process.env.ZCODE_CLI_HOME || path.join(STATE_DIR, "cli-home");
+function cliKeyStored(bridge) {
+  try {
+    return fs.existsSync(path.join(CLI_HOME, bridge, ".zcode", "v2", "credentials.json"));
+  } catch {
+    return false;
+  }
+}
 function loadModels() {
   let cache = null;
   try {
     cache = JSON.parse(fs.readFileSync(MODELS_FILE, "utf8"));
   } catch {}
   const list = (cache?.models || []).filter((m) => m.enabled).map((m) => ({ value: slug(m.name), name: m.name, bridge: m.name }));
-  const models = withFreeTwins(list.length ? list : FALLBACK_MODELS);
+  const models = withTariffs(list.length ? list : FALLBACK_MODELS);
   const wanted = MODEL_OVERRIDE && models.find((m) => m.name.toLowerCase() === MODEL_OVERRIDE.toLowerCase() || m.value === slug(MODEL_OVERRIDE));
-  const own = cache?.default && models.find((m) => m.name === cache.default);
+  const own = cache?.default && models.find((m) => m.bridge === cache.default);
   return { models, defaultModel: (wanted || own || models[0]).value, stale: !cache || Date.now() - (cache.at || 0) * 1000 > MODELS_MAX_AGE_MS };
 }
-// The Start Plan's free tokens are for Flash: each Flash model gets a «· Free» twin that runs only on them, and the plain one runs on the plan,
-// so the model picked in BB says who pays. Other models follow ZCODE_ROUTE.
-function withFreeTwins(models) {
-  return models.flatMap((m) =>
-    /flash/i.test(m.name) && !m.route
-      ? [{ ...m, route: "plan" }, { value: `${m.value}-free`, name: `${m.name} · Free`, bridge: m.bridge, route: "free" }]
-      : [m],
-  );
+// Every model carries its tariff in the name, and the ids (values) never change: a Flash model runs on the plan and gets a «· Free»
+// twin on the Start Plan's free tokens; when the CLI's Coding Plan key is stored, a model the CLI can run is named «· Paid» and its
+// turns go through the CLI. Without a stored key the names stay as they are on the plan.
+function withTariffs(models) {
+  return models.flatMap((m) => {
+    const paid = CLI_MODELS.has(m.bridge) && cliKeyStored(m.bridge) ? { ...m, name: `${m.name} · Paid` } : m;
+    return /flash/i.test(m.name) && !m.route
+      ? [{ ...paid, route: "plan" }, { value: `${m.value}-free`, name: `${m.name} · Free`, bridge: m.bridge, route: "free" }]
+      : [paid];
+  });
 }
-let MODELS = withFreeTwins(FALLBACK_MODELS);
+let MODELS = withTariffs(FALLBACK_MODELS);
 let DEFAULT_MODEL = FALLBACK_MODELS[0].value;
 function refreshModelList() {
   const m = loadModels();
@@ -177,7 +198,7 @@ function sessionState(s) {
   };
 }
 function newSession(id, cwd) {
-  const s = { id, cwd, taskId: null, model: DEFAULT_MODEL, effort: DEFAULT_EFFORT, active: null, cancelled: false, cancelling: null, cancelDone: false, mcpRecord: null, firstModel: null, firstEffort: null };
+  const s = { id, cwd, taskId: null, cliSessionId: null, cliChildEpoch: 0, backend: null, model: DEFAULT_MODEL, effort: DEFAULT_EFFORT, active: null, cancelled: false, cancelling: null, cancelDone: false, mcpRecord: null, firstModel: null, firstEffort: null };
   sessions.set(id, s);
   return s;
 }
@@ -390,6 +411,8 @@ async function endSession(s) {
     if (s.taskId) {
       const st = await runBridge(["status", s.taskId], { timeoutMs: 30000 });
       if (st.ok && !["completed", "error", "cancelled"].includes(st.state)) await ensureCancel(s);
+    } else if (s.active) {
+      await ensureCancel(s); // a CLI conversation: the child agent is told session/cancel
     }
   } catch (e) {
     log("end of session: cancel failed:", String(e?.message || e));
@@ -457,6 +480,87 @@ async function withPromptFile(text, fn) {
   } finally {
     fs.rmSync(file, { force: true });
   }
+}
+
+// ---------------------------------------------------------------- paid backend: the ZCode CLI (a child ACP agent)
+// A turn on a «· Paid» model (the CLI supports the model and its Coding Plan key is stored) runs in a `zcode-cli-acp.mjs` child
+// agent: one child per process, spawned on the first paid turn and initialized once. The child's session/update notifications are
+// relayed to the client with the parent session's id, and its requests (e.g. a permission card) go to the client and back. The child
+// keeps no state of ours: when it dies, its pending requests are rejected and the next paid turn spawns and initializes a new one,
+// which also starts a fresh CLI conversation for the session (the child session id is reset on respawn).
+const CLI_AGENT = process.env.ZCODE_ACP_CLI_AGENT || (() => {
+  try {
+    return path.join(path.dirname(fs.realpathSync(process.argv[1])), "zcode-cli-acp.mjs");
+  } catch {
+    return "zcode-cli-acp.mjs";
+  }
+})();
+let cli = null;
+let cliEpoch = 0;
+function cliSend(child, message) {
+  try {
+    child.proc.stdin.write(JSON.stringify({ jsonrpc: "2.0", ...message }) + "\n");
+  } catch {}
+}
+function cliRequest(child, method, params) {
+  const id = `cli-${child.nextId++}`;
+  return new Promise((resolve, reject) => {
+    child.pending.set(id, { resolve, reject });
+    cliSend(child, { id, method, params });
+  });
+}
+function dropCliChild(child, why) {
+  if (cli !== child) return;
+  cli = null;
+  for (const p of child.pending.values()) p.reject(new AcpError(-32603, `ZCode CLI agent ${why}`));
+  child.pending.clear();
+  try {
+    child.proc.kill("SIGTERM");
+  } catch {}
+}
+function cliParent(msg) {
+  return [...sessions.values()].find((s) => s.cliSessionId === msg.params?.sessionId);
+}
+function onCliLine(child, line) {
+  let msg;
+  try {
+    msg = JSON.parse(line);
+  } catch {
+    return;
+  }
+  if (msg.method === "session/update") {
+    const parent = cliParent(msg);
+    if (parent) update(parent.id, msg.params.update);
+  } else if (msg.method === undefined) {
+    const p = child.pending.get(msg.id);
+    if (!p) return;
+    child.pending.delete(msg.id);
+    if (msg.error) p.reject(new AcpError(msg.error.code || -32603, msg.error.message || "CLI agent error"));
+    else p.resolve(msg.result);
+  } else {
+    // a request of the child (e.g. session/request_permission): put it to the client, relay the answer back
+    const parent = cliParent(msg);
+    requestClient(msg.method, parent ? { ...msg.params, sessionId: parent.id } : msg.params).then(
+      (result) => cliSend(child, { id: msg.id, result: result ?? {} }),
+      (e) => cliSend(child, { id: msg.id, error: { code: -32603, message: String(e?.message || e) } }),
+    );
+  }
+}
+async function ensureCliChild() {
+  if (cli && (cli.proc.exitCode !== null || cli.proc.signalCode !== null)) dropCliChild(cli, "exited"); // never reuse a dead child
+  if (cli) return cli;
+  const child = { proc: null, pending: new Map(), nextId: 1, epoch: ++cliEpoch };
+  const argv = [CLI_AGENT, ...(BB_PERMISSION ? [`--bb-permission=${BB_PERMISSION}`] : [])];
+  const proc = spawn(process.execPath, argv, { stdio: ["pipe", "pipe", "pipe"] });
+  child.proc = proc;
+  cli = child;
+  log("zcode-cli-acp child agent pid", proc.pid);
+  proc.stderr.on("data", (d) => log("zcode-cli-acp:", String(d).trim()));
+  readline.createInterface({ input: proc.stdout }).on("line", (line) => onCliLine(child, line));
+  proc.on("exit", () => dropCliChild(child, "exited"));
+  proc.on("error", (e) => dropCliChild(child, String(e.message)));
+  await cliRequest(child, "initialize", { protocolVersion: 1 });
+  return child;
 }
 
 // ---------------------------------------------------------------- parallel limit
@@ -760,6 +864,86 @@ let resetChain = Promise.resolve();
 
 // A chat's folder works in the ZCode project of that folder (or of the git repository it lies in); an unknown folder is registered by the
 // bridge through ZCode's own open-folder link, unless ZCODE_ACP_AUTOADD=0.
+// The backend a model's turns run on: a free model runs on the Start Plan through the window; a model whose Coding Plan key is
+// stored and whose bridge name the ZCode CLI supports (a «· Paid» model) runs through the CLI; everything else runs through the
+// window on the plan (Flash with `--route plan`, the rest following ZCODE_ROUTE), as on the base.
+function modelBackend(model) {
+  if (model.route === "free") return "window";
+  return CLI_MODELS.has(model.bridge) && cliKeyStored(model.bridge) ? "cli" : "window";
+}
+
+// One paid turn: make sure the child agent is up, open its conversation lazily (a respawn means a fresh one), put the model and
+// reasoning on it, and return the child's prompt result (its updates and requests are relayed as they come).
+async function runCliTurn(s, model, text) {
+  const child = await ensureCliChild();
+  if (!s.cliSessionId || s.cliChildEpoch !== child.epoch) {
+    // BB's MCP servers are already merged into <cwd>/.zcode/config.json for this session; the CLI reads them from there.
+    const r = await cliRequest(child, "session/new", { cwd: s.cwd, mcpServers: [] });
+    s.cliSessionId = r.sessionId;
+    s.cliChildEpoch = child.epoch;
+    s.backend = "cli";
+  }
+  await cliRequest(child, "session/set_config_option", { sessionId: s.cliSessionId, configId: "model", value: model.bridge });
+  await cliRequest(child, "session/set_config_option", { sessionId: s.cliSessionId, configId: "effort", value: s.effort });
+  const result = await cliRequest(child, "session/prompt", { sessionId: s.cliSessionId, prompt: [{ type: "text", text }] });
+  return result || { stopReason: "end_turn" };
+}
+
+async function runWindowTurn(s, turn, model, eff, text) {
+  s.usedPlan = s.usedPlan || eff.mode === "plan";
+  if (!s.taskId) {
+    s.usedModel = model.bridge;
+    const args = ["send", "--folder", s.cwd, "--prompt-file", "<file>", "--model", model.bridge, "--effort", s.effort, ...modeArgs(eff.mode)];
+    const route = model.route || ROUTE;
+    if (route !== "keep") args.push("--route", route);
+    if (!AUTOADD) args.push("--no-create-project");
+    const res = await withPromptFile(text, (file) => runBridgeQueued(s, args.map((a) => (a === "<file>" ? file : a))));
+    if (!res.ok) throw bridgeError(res);
+    s.taskId = res.task_id;
+    s.projectCreated = res.project_created === true;
+    s.firstModel = s.model;
+    s.firstEffort = s.effort;
+    s.backend = "window";
+    saveSession(s);
+  } else {
+    if (s.firstModel && (s.firstModel !== s.model || s.firstEffort !== s.effort)) {
+      update(s.id, { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: `ZCode keeps the model and reasoning level a task started with (${s.firstModel}, ${s.firstEffort}); the change applies to a new chat.\n` } });
+    }
+    await turn.baseline();
+    const res = await withPromptFile(text, (file) => runBridgeQueued(s, ["continue", s.taskId, "--prompt-file", file, ...modeArgs(eff.mode)]));
+    if (!res.ok) throw bridgeError(res);
+  }
+  if (s.cancelled) {
+    await ensureCancel(s);
+    return { stopReason: "cancelled" };
+  }
+  let state = await turn.stream();
+  let status = turn.lastState && Object.hasOwn(turn.lastState, "tokens") ? { ok: true, ...turn.lastState } : await runBridge(["status", s.taskId]);
+  for (let i = 0; state === "error" && !s.cancelled && i < RATE_RETRY_S.length && /model_rate_limited/.test((status.ok && status.error) || ""); i++) {
+    update(s.id, { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: `ZCode: the plan refused the request (${status.error}); sending the task again in ${RATE_RETRY_S[i]} s (${i + 1} of ${RATE_RETRY_S.length}).\n` } });
+    await pause(s, RATE_RETRY_S[i] * 1000);
+    if (s.cancelled) break;
+    await turn.baseline();
+    const res = await withPromptFile(RATE_RETRY_TEXT, (file) => runBridgeQueued(s, ["continue", s.taskId, "--prompt-file", file]));
+    if (!res.ok) throw bridgeError(res);
+    state = await turn.stream();
+    status = turn.lastState && Object.hasOwn(turn.lastState, "tokens") ? { ok: true, ...turn.lastState } : await runBridge(["status", s.taskId]);
+  }
+  const tok = status.ok && status.tokens ? status.tokens : null;
+  if (tok) update(s.id, { sessionUpdate: "usage_update", used: tok.input ?? 0, size: 1000000, _meta: { zcode: { inputTokens: tok.input ?? 0, cacheReadTokens: tok.cache_read ?? 0, freshInputTokens: Math.max(0, (tok.input ?? 0) - (tok.cache_read ?? 0)), outputTokens: tok.output ?? 0, reasoningTokens: tok.reasoning ?? 0, taskId: s.taskId } } });
+  const usage = tok ? { inputTokens: tok.input ?? 0, outputTokens: tok.output ?? 0, thoughtTokens: tok.reasoning ?? 0, cachedReadTokens: tok.cache_read ?? 0, totalTokens: (tok.input ?? 0) + (tok.output ?? 0) } : undefined;
+  if (state === "cancelled" || s.cancelled) {
+    await ensureCancel(s); // idempotent; also stops a task whose card BB cancelled (the deny lets the model go on)
+    return { stopReason: "cancelled", ...(usage ? { usage } : {}) };
+  }
+  if (state === "error") throw new AcpError(-32603, `ZCode turn failed: ${(status.ok && status.error) || "unknown error"}`);
+  if (!turn.emitted) {
+    const result = await runBridge(["result", s.taskId]);
+    if (result.ok && result.answer) update(s.id, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: result.answer } });
+  }
+  return { stopReason: "end_turn", ...(usage ? { usage } : {}) };
+}
+
 async function runPrompt(s, params) {
   const text = renderPrompt(params.prompt);
   if (!text) throw new AcpError(-32602, "empty prompt");
@@ -776,58 +960,24 @@ async function runPrompt(s, params) {
       s.announced = true;
       update(s.id, { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: `ZCode mode: ${MODE_NAMES[eff.mode]} (${eff.why}).\n` } });
     }
-    s.usedPlan = s.usedPlan || eff.mode === "plan";
-    if (!s.taskId) {
-      const model = MODELS.find((m) => m.value === s.model) || MODELS[0];
-      s.usedModel = model.bridge;
-      const args = ["send", "--folder", s.cwd, "--prompt-file", "<file>", "--model", model.bridge, "--effort", s.effort, ...modeArgs(eff.mode)];
-      const route = model.route || ROUTE;
-      if (route !== "keep") args.push("--route", route);
-      if (!AUTOADD) args.push("--no-create-project");
-      const res = await withPromptFile(text, (file) => runBridgeQueued(s, args.map((a) => (a === "<file>" ? file : a))));
-      if (!res.ok) throw bridgeError(res);
-      s.taskId = res.task_id;
-      s.projectCreated = res.project_created === true;
-      s.firstModel = s.model;
-      s.firstEffort = s.effort;
-      saveSession(s);
-    } else {
-      if (s.firstModel && (s.firstModel !== s.model || s.firstEffort !== s.effort)) {
-        update(s.id, { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: `ZCode keeps the model and reasoning level a task started with (${s.firstModel}, ${s.firstEffort}); the change applies to a new chat.\n` } });
-      }
-      await turn.baseline();
-      const res = await withPromptFile(text, (file) => runBridgeQueued(s, ["continue", s.taskId, "--prompt-file", file, ...modeArgs(eff.mode)]));
-      if (!res.ok) throw bridgeError(res);
+    const model = MODELS.find((m) => m.value === s.model) || MODELS[0];
+    const backend = modelBackend(model);
+    if (s.backend && s.backend !== backend) {
+      // The other backend knows none of this conversation: it starts fresh there.
+      update(s.id, { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: `The tariff switched to the ${backend === "cli" ? "Coding Plan (ZCode CLI)" : "ZCode window"} backend; the chat starts a fresh conversation there.\n` } });
+      s.taskId = null;
+      s.cliSessionId = null;
+      s.watchCursor = null;
+      s.firstModel = null;
+      s.firstEffort = null;
+      s.backend = null;
     }
-    if (s.cancelled) {
-      await ensureCancel(s);
-      return { stopReason: "cancelled" };
+    if (backend === "cli") {
+      const r = await runCliTurn(s, model, text);
+      if (s.cancelled && (!r || r.stopReason !== "cancelled")) return { stopReason: "cancelled" };
+      return r;
     }
-    let state = await turn.stream();
-    let status = turn.lastState && Object.hasOwn(turn.lastState, "tokens") ? { ok: true, ...turn.lastState } : await runBridge(["status", s.taskId]);
-    for (let i = 0; state === "error" && !s.cancelled && i < RATE_RETRY_S.length && /model_rate_limited/.test((status.ok && status.error) || ""); i++) {
-      update(s.id, { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: `ZCode: the plan refused the request (${status.error}); sending the task again in ${RATE_RETRY_S[i]} s (${i + 1} of ${RATE_RETRY_S.length}).\n` } });
-      await pause(s, RATE_RETRY_S[i] * 1000);
-      if (s.cancelled) break;
-      await turn.baseline();
-      const res = await withPromptFile(RATE_RETRY_TEXT, (file) => runBridgeQueued(s, ["continue", s.taskId, "--prompt-file", file]));
-      if (!res.ok) throw bridgeError(res);
-      state = await turn.stream();
-      status = turn.lastState && Object.hasOwn(turn.lastState, "tokens") ? { ok: true, ...turn.lastState } : await runBridge(["status", s.taskId]);
-    }
-    const tok = status.ok && status.tokens ? status.tokens : null;
-    if (tok) update(s.id, { sessionUpdate: "usage_update", used: tok.input ?? 0, size: 1000000, _meta: { zcode: { inputTokens: tok.input ?? 0, cacheReadTokens: tok.cache_read ?? 0, freshInputTokens: Math.max(0, (tok.input ?? 0) - (tok.cache_read ?? 0)), outputTokens: tok.output ?? 0, reasoningTokens: tok.reasoning ?? 0, taskId: s.taskId } } });
-    const usage = tok ? { inputTokens: tok.input ?? 0, outputTokens: tok.output ?? 0, thoughtTokens: tok.reasoning ?? 0, cachedReadTokens: tok.cache_read ?? 0, totalTokens: (tok.input ?? 0) + (tok.output ?? 0) } : undefined;
-    if (state === "cancelled" || s.cancelled) {
-      await ensureCancel(s); // idempotent; also stops a task whose card BB cancelled (the deny lets the model go on)
-      return { stopReason: "cancelled", ...(usage ? { usage } : {}) };
-    }
-    if (state === "error") throw new AcpError(-32603, `ZCode turn failed: ${(status.ok && status.error) || "unknown error"}`);
-    if (!turn.emitted) {
-      const result = await runBridge(["result", s.taskId]);
-      if (result.ok && result.answer) update(s.id, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: result.answer } });
-    }
-    return { stopReason: "end_turn", ...(usage ? { usage } : {}) };
+    return await runWindowTurn(s, turn, model, eff, text);
   } catch (e) {
     if (e instanceof AcpError && e.code === -32800) return { stopReason: "cancelled" };
     throw e;
@@ -847,9 +997,13 @@ function ensureCancel(s) {
   if (s.cancelDone) return Promise.resolve();
   if (s.active?.child) s.active.child.kill("SIGTERM");
   s.cancelling = (async () => {
-    if (!s.taskId) return;
-    const res = await runBridge(["cancel", s.taskId]);
-    if (!res.ok) log("cancel failed:", JSON.stringify(res.error));
+    if (s.backend === "cli") {
+      const child = cli;
+      if (child && s.cliSessionId) cliSend(child, { method: "session/cancel", params: { sessionId: s.cliSessionId } });
+    } else if (s.taskId) {
+      const res = await runBridge(["cancel", s.taskId]);
+      if (!res.ok) log("cancel failed:", JSON.stringify(res.error));
+    }
     s.cancelDone = true;
   })().finally(() => {
     s.cancelling = null;
