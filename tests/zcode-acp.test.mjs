@@ -526,3 +526,123 @@ test("when the CLI child agent exits, the next paid turn starts a new child and 
     agent.close();
   }
 });
+
+test("with the app token readable and the key stored, a turn on glm-5.3-flash-free runs through the CLI on the Start Plan", async () => {
+  const { agent, cwd, dir, rec, calls, cliTurns } = setupCli();
+  seedFreeCliStores(dir);
+  try {
+    await agent.request("initialize", { protocolVersion: 1 });
+    const s = await agent.request("session/new", { cwd, mcpServers: [] });
+    const names = s.configOptions.find((o) => o.category === "model").options.map((o) => o.name);
+    assert.ok(names.includes("GLM-5.3-Flash · Free"), `model names: ${names}`);
+    await agent.request("session/set_config_option", { sessionId: s.sessionId, configId: "model", value: "glm-5.3-flash-free" });
+    const r = await prompt(agent, s.sessionId, "free hello");
+    assert.equal(r.stopReason, "end_turn");
+    assert.equal(calls().length, 0, "the window bridge was not used");
+    assert.equal(cliTurns().length, 1, "the CLI ran the turn");
+    assert.ok(text(agent.updates).includes("cli-answer"));
+    const turn = JSON.parse(fs.readFileSync(path.join(rec, "turn-1.json"), "utf8"));
+    assert.equal(turn.env.ZCODE_DATA_BASE_DIR, path.join(dir, "cli-home", "start-plan"));
+    const configFile = path.join(dir, "cli-home", "start-plan", ".zcode", "v2", "provider_config.json");
+    const blob = fs.readFileSync(configFile, "utf8");
+    assert.ok(blob.includes("https://zcode.z.ai/api/v1/zcode-plan/anthropic"), "the Start Plan endpoint");
+    assert.ok(blob.includes("Bearer dummy-app-jwt-not-real"), "the app token as the Authorization header");
+    assert.equal(fs.statSync(configFile).mode & 0o077, 0, "provider_config.json is private (0600)");
+  } finally {
+    agent.close();
+  }
+});
+
+test("without a readable app token a turn on glm-5.3-flash-free falls back to the window with --route free", async () => {
+  const { agent, cwd, calls, cliTurns } = setupCli();
+  try {
+    await agent.request("initialize", { protocolVersion: 1 });
+    const s = await agent.request("session/new", { cwd, mcpServers: [] });
+    await agent.request("session/set_config_option", { sessionId: s.sessionId, configId: "model", value: "glm-5.3-flash-free" });
+    const r = await prompt(agent, s.sessionId, "free hello");
+    assert.equal(r.stopReason, "end_turn");
+    assert.match(calls()[0], / --route free/);
+    assert.equal(cliTurns().length, 0, "the CLI was not started");
+  } finally {
+    agent.close();
+  }
+});
+
+test("with an undecryptable app credentials.json a turn on glm-5.3-flash-free falls back to the window with --route free", async () => {
+  const { agent, cwd, dir, calls, cliTurns } = setupCli();
+  seedFreeCliStores(dir);
+  fs.writeFileSync(path.join(dir, ".zcode", "v2", "credentials.json"), JSON.stringify({ zcodejwttoken: "enc:v1:AAAAAAAAAAAAAAAAAAAAAA.AAAAAAAAAAAAAAAAAAAAAA.AAAAAAAAAAAAAAAAAAAA" }));
+  try {
+    await agent.request("initialize", { protocolVersion: 1 });
+    const s = await agent.request("session/new", { cwd, mcpServers: [] });
+    await agent.request("session/set_config_option", { sessionId: s.sessionId, configId: "model", value: "glm-5.3-flash-free" });
+    const r = await prompt(agent, s.sessionId, "free hello");
+    assert.equal(r.stopReason, "end_turn");
+    assert.match(calls()[0], / --route free/);
+    assert.equal(cliTurns().length, 0, "the CLI was not started");
+  } finally {
+    agent.close();
+  }
+});
+
+test("a Start Plan quota result (providerCode 1005, exceed quota limit) reaches the client as an error naming the quota", async () => {
+  const { agent, cwd, dir } = setupCli({ extraEnv: { FAKE_ZCODE_QUOTA: "1" } });
+  seedFreeCliStores(dir);
+  try {
+    await agent.request("initialize", { protocolVersion: 1 });
+    const s = await agent.request("session/new", { cwd, mcpServers: [] });
+    await agent.request("session/set_config_option", { sessionId: s.sessionId, configId: "model", value: "glm-5.3-flash-free" });
+    await assert.rejects(prompt(agent, s.sessionId, "free hello"), /Start Plan.*quota/);
+  } finally {
+    agent.close();
+  }
+});
+
+test("a CLI failure echoing the app token yields an error, session updates and agent stderr without the token", async () => {
+  const token = "dummy-app-jwt-not-real";
+  const { agent, cwd, dir } = setupCli({ extraEnv: { FAKE_ZCODE_LEAK: `provider_config: Authorization Bearer ${token} end` } });
+  seedFreeCliStores(dir);
+  try {
+    await agent.request("initialize", { protocolVersion: 1 });
+    const s = await agent.request("session/new", { cwd, mcpServers: [] });
+    await agent.request("session/set_config_option", { sessionId: s.sessionId, configId: "model", value: "glm-5.3-flash-free" });
+    await assert.rejects(prompt(agent, s.sessionId, "free hello"), (e) => {
+      assert.equal(String(e.message).includes(token), false, "the error message carries the token");
+      return /set-key/.test(String(e.message));
+    });
+    assert.equal(JSON.stringify(agent.updates).includes(token), false, "session updates carry the token");
+    assert.equal(fs.readFileSync(path.join(dir, ".zcode-bridge", "acp.log"), "utf8").includes(token), false, "the agent's stderr carries the token");
+    const childLog = path.join(dir, ".zcode-bridge", "cli-acp.log");
+    if (fs.existsSync(childLog)) assert.equal(fs.readFileSync(childLog, "utf8").includes(token), false, "the CLI agent's stderr carries the token");
+  } finally {
+    agent.close();
+  }
+});
+
+// Credential helpers for the headless free-turn tests, loaded here so the diff to this file stays one append at the end.
+const { createCipheriv, createHash, randomBytes } = await import("node:crypto");
+
+// A value encrypted the way ZCode and set-key encrypt credentials (AES-256-GCM, fallback key of platform + HOME + user).
+function encValue(plain, key) {
+  const iv = randomBytes(12);
+  const cipher = createCipheriv("aes-256-gcm", key, iv);
+  const ct = Buffer.concat([cipher.update(plain, "utf8"), cipher.final()]);
+  return `enc:v1:${iv.toString("base64url")}.${cipher.getAuthTag().toString("base64url")}.${ct.toString("base64url")}`;
+}
+function credentialKeyOf(dir) {
+  return createHash("sha256").update(`zcode-credential-fallback:${os.platform()}:${dir}:${os.userInfo().username}`).digest();
+}
+// The desktop app's credential store with a dummy zcodejwttoken, at the path the agents read it from.
+function writeAppCredentials(dir, token = "dummy-app-jwt-not-real") {
+  fs.mkdirSync(path.join(dir, ".zcode", "v2"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".zcode", "v2", "credentials.json"), JSON.stringify({ zcodejwttoken: encValue(token, credentialKeyOf(dir)) }));
+  return token;
+}
+// Everything a «· Free» turn through the CLI needs: the app's zcodejwttoken and a decryptable Coding Plan key entry in the
+// GLM-5.3-Flash key store (the layout `zcode-cli-acp set-key` leaves).
+function seedFreeCliStores(dir) {
+  writeAppCredentials(dir);
+  const v2 = path.join(dir, "cli-home", "GLM-5.3-Flash", ".zcode", "v2");
+  fs.mkdirSync(v2, { recursive: true });
+  fs.writeFileSync(path.join(v2, "credentials.json"), JSON.stringify({ "account-provider:coding-plan:account:acc:api-key": encValue("dummyid.dummysecret", credentialKeyOf(dir)) }), { mode: 0o600 });
+}

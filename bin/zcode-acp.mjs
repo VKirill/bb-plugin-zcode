@@ -33,7 +33,7 @@
 //   ZCODE_ACP_BRIDGE (path of zcbridge), ZCODE_MAX_PARALLEL (read by zcbridge), ZCODE_ACP_QUEUE_TIMEOUT (seconds, default 900),
 //   ZCODE_ACP_PERMISSION_TIMEOUT (seconds, default 600)
 import { execFileSync, spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import crypto, { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -140,8 +140,13 @@ const pendingClient = new Map();
 function send(message) {
   process.stdout.write(JSON.stringify({ jsonrpc: "2.0", ...message }) + "\n");
 }
+function redact(text) {
+  let t = String(text ?? "");
+  if (APP_TOKEN) t = t.split(APP_TOKEN).join("<redacted>");
+  return t.replace(/Bearer \S+/g, "Bearer <redacted>");
+}
 function log(...parts) {
-  const line = `${new Date().toISOString()} ${parts.join(" ")}`;
+  const line = `${new Date().toISOString()} ${parts.map(redact).join(" ")}`;
   process.stderr.write(line + "\n");
   try {
     fs.mkdirSync(STATE_DIR, { recursive: true });
@@ -149,6 +154,7 @@ function log(...parts) {
   } catch {}
 }
 function update(sessionId, upd) {
+  if (upd && upd.content && typeof upd.content.text === "string") upd = { ...upd, content: { ...upd.content, text: redact(upd.content.text) } };
   send({ method: "session/update", params: { sessionId, update: upd } });
 }
 function requestClient(method, params) {
@@ -495,6 +501,29 @@ const CLI_AGENT = process.env.ZCODE_ACP_CLI_AGENT || (() => {
     return "zcode-cli-acp.mjs";
   }
 })();
+// The model value the CLI child agent runs a «· Free» turn on (its Start Plan model, see bin/zcode-cli-acp.mjs).
+const CLI_FREE_MODEL = "GLM-5.3-Flash-Free";
+let APP_TOKEN = null;
+// The desktop app's own token: entry `zcodejwttoken` of ~/.zcode/v2/credentials.json (env ZCODE_APP_CREDENTIALS overrides the
+// path), encrypted the same way set-key encrypts keys. Only readability is decided here (it routes «· Free» turns); the value is
+// kept for redacting logs and relayed errors and is never logged itself.
+function appTokenReadable() {
+  try {
+    const file = process.env.ZCODE_APP_CREDENTIALS || path.join(HOME, ".zcode", "v2", "credentials.json");
+    const creds = JSON.parse(fs.readFileSync(file, "utf8"));
+    const body = String(creds?.zcodejwttoken ?? "");
+    if (!body.startsWith("enc:v1:")) throw new Error("bad format");
+    const [ivB, tagB, ctB] = body.slice("enc:v1:".length).split(".");
+    const secret = process.env.ZCODE_CREDENTIAL_SECRET || `zcode-credential-fallback:${os.platform()}:${HOME}:${os.userInfo().username}`;
+    const decipher = crypto.createDecipheriv("aes-256-gcm", crypto.createHash("sha256").update(secret).digest(), Buffer.from(ivB, "base64url"));
+    decipher.setAuthTag(Buffer.from(tagB, "base64url"));
+    const token = Buffer.concat([decipher.update(Buffer.from(ctB, "base64url")), decipher.final()]).toString("utf8").trim();
+    APP_TOKEN = token || null;
+  } catch {
+    APP_TOKEN = null;
+  }
+  return APP_TOKEN !== null;
+}
 let cli = null;
 let cliEpoch = 0;
 function cliSend(child, message) {
@@ -865,25 +894,28 @@ let resetChain = Promise.resolve();
 // A chat's folder works in the ZCode project of that folder (or of the git repository it lies in); an unknown folder is registered by the
 // bridge through ZCode's own open-folder link, unless ZCODE_ACP_AUTOADD=0.
 // The backend a model's turns run on: a free model runs on the Start Plan through the window; a model whose Coding Plan key is
-// stored and whose bridge name the ZCode CLI supports (a «· Paid» model) runs through the CLI; everything else runs through the
-// window on the plan (Flash with `--route plan`, the rest following ZCODE_ROUTE), as on the base.
+// stored and whose bridge name the ZCode CLI supports (a «· Paid» model) runs through the CLI; a «· Free» model runs through the
+// CLI too (as the backend "cli-free", on the Start Plan) when the app's zcodejwttoken is readable and the Coding Plan key is
+// stored; everything else runs through the window on the plan (Flash with `--route plan`, free with `--route free`).
 function modelBackend(model) {
-  if (model.route === "free") return "window";
+  if (model.route === "free") return CLI_MODELS.has(model.bridge) && appTokenReadable() && cliKeyStored(model.bridge) ? "cli-free" : "window";
   return CLI_MODELS.has(model.bridge) && cliKeyStored(model.bridge) ? "cli" : "window";
 }
 
-// One paid turn: make sure the child agent is up, open its conversation lazily (a respawn means a fresh one), put the model and
-// reasoning on it, and return the child's prompt result (its updates and requests are relayed as they come).
+// One turn through the CLI child agent: make sure the child agent is up, open its conversation lazily (a respawn or a tariff
+// change means a fresh one), put the model and reasoning on it, and return the child's prompt result (its updates and requests
+// are relayed as they come). The free tariff selects the child's Start Plan model.
 async function runCliTurn(s, model, text) {
   const child = await ensureCliChild();
+  const cliModel = model.route === "free" ? CLI_FREE_MODEL : model.bridge;
   if (!s.cliSessionId || s.cliChildEpoch !== child.epoch) {
     // BB's MCP servers are already merged into <cwd>/.zcode/config.json for this session; the CLI reads them from there.
     const r = await cliRequest(child, "session/new", { cwd: s.cwd, mcpServers: [] });
     s.cliSessionId = r.sessionId;
     s.cliChildEpoch = child.epoch;
-    s.backend = "cli";
+    s.backend = model.route === "free" ? "cli-free" : "cli";
   }
-  await cliRequest(child, "session/set_config_option", { sessionId: s.cliSessionId, configId: "model", value: model.bridge });
+  await cliRequest(child, "session/set_config_option", { sessionId: s.cliSessionId, configId: "model", value: cliModel });
   await cliRequest(child, "session/set_config_option", { sessionId: s.cliSessionId, configId: "effort", value: s.effort });
   const result = await cliRequest(child, "session/prompt", { sessionId: s.cliSessionId, prompt: [{ type: "text", text }] });
   return result || { stopReason: "end_turn" };
@@ -972,7 +1004,7 @@ async function runPrompt(s, params) {
       s.firstEffort = null;
       s.backend = null;
     }
-    if (backend === "cli") {
+    if (backend !== "window") {
       const r = await runCliTurn(s, model, text);
       if (s.cancelled && (!r || r.stopReason !== "cancelled")) return { stopReason: "cancelled" };
       return r;
@@ -1091,7 +1123,7 @@ rl.on("line", (line) => {
     (result) => send({ id: msg.id, result: result ?? {} }),
     (e) => {
       log("error in", msg.method, String(e?.message || e));
-      send({ id: msg.id, error: { code: e instanceof AcpError ? e.code : -32603, message: String(e?.message || e) } });
+      send({ id: msg.id, error: { code: e instanceof AcpError ? e.code : -32603, message: redact(String(e?.message || e)) } });
     },
   );
 });
