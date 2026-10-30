@@ -6,7 +6,7 @@
 # What it does (nothing outside your home folder, nothing inside /Applications/ZCode.app):
 #   1. checks macOS, Python 3, Node 20+, the Swift compiler (Xcode Command Line Tools) and the ZCode app;
 #   2. builds the accessibility helper zcax from native/zcax.swift;
-#   3. copies zcbridge, zcax, zcode-acp (+ zcode-acp.mjs) to ~/.local/share/zcode-bridge and links the three commands into --bin-dir
+#   3. copies zcbridge, zcax, zcode-acp, zcode-cli-acp (+ .mjs) to ~/.local/share/zcode-bridge and links the commands into --bin-dir
 #      (default ~/.local/bin; BB's host daemon must have that folder on its PATH, or set the plugin's "Agent command" to the full path);
 #   4. with --default-mode writes ~/.zcode-bridge/config.json (the mode `zcbridge send` uses when you name none);
 #   5. with --rewards-job installs a LaunchAgent that claims ZCode's daily token banner (see README);
@@ -42,7 +42,7 @@ PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 
 if [ "$UNINSTALL" = 1 ]; then
   say "Uninstalling the ZCode bridge from $SHARE and $BIN_DIR"
-  for c in zcbridge zcode-acp zcax; do
+  for c in zcbridge zcode-acp zcode-cli-acp zcax; do
     if [ -L "$BIN_DIR/$c" ] && [[ "$(readlink "$BIN_DIR/$c")" == "$SHARE"/* ]]; then run rm -f "$BIN_DIR/$c"; fi
   done
   if [ -f "$PLIST" ]; then run launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true; run rm -f "$PLIST"; fi
@@ -71,9 +71,9 @@ run swiftc -O -o "$BUILD/zcax" "$SRC/native/zcax.swift"
 # 3. install
 say "Installing to $SHARE and linking into $BIN_DIR"
 run mkdir -p "$SHARE" "$BIN_DIR"
-for f in zcbridge zcode-acp zcode-acp.mjs; do run install -m 0755 "$SRC/bin/$f" "$SHARE/$f"; done
+for f in zcbridge zcode-acp zcode-acp.mjs zcode-cli-acp zcode-cli-acp.mjs; do run install -m 0755 "$SRC/bin/$f" "$SHARE/$f"; done
 run install -m 0755 "$BUILD/zcax" "$SHARE/zcax"
-for c in zcbridge zcode-acp zcax; do
+for c in zcbridge zcode-acp zcode-cli-acp zcax; do
   if [ -e "$BIN_DIR/$c" ] && [ ! -L "$BIN_DIR/$c" ]; then
     say "  $BIN_DIR/$c exists and is not a link: moving it to $BIN_DIR/$c.bak"
     run mv "$BIN_DIR/$c" "$BIN_DIR/$c.bak"
