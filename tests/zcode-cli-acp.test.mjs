@@ -86,6 +86,21 @@ test("turn 1 argv and env, turn 2 resumes, usage and response, model dir after s
   }
 });
 
+test("pretty-printed CLI JSON (FAKE_ZCODE_PRETTY=1) still yields the response and usage", async () => {
+  const { agent, cwd } = setup({ FAKE_ZCODE_PRETTY: "1", FAKE_ZCODE_RESPONSE: "pretty-ok", FAKE_ZCODE_INPUT: "5" });
+  try {
+    await agent.request("initialize", { protocolVersion: 1 });
+    const s = await agent.request("session/new", { cwd, mcpServers: [] });
+    const r = await prompt(agent, s.sessionId, "hi");
+    assert.equal(r.stopReason, "end_turn");
+    assert.equal(text(agent.updates), "pretty-ok");
+    const usage = agent.updates.find((u) => u.sessionUpdate === "usage_update");
+    assert.equal(usage.inputTokens, 5);
+  } finally {
+    agent.close();
+  }
+});
+
 test("a 20000-character prompt is passed with --attach and the file is removed after the turn", async () => {
   const { agent, cwd, turns } = setup();
   try {

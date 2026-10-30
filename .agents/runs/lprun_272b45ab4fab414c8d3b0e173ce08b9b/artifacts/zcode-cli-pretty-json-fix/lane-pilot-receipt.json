@@ -1,0 +1,157 @@
+{
+  "schemaVersion": 1,
+  "status": "accepted",
+  "lanePilotRunId": "lprun_272b45ab4fab414c8d3b0e173ce08b9b",
+  "lanePilotTaskId": "zcode-cli-pretty-json-fix",
+  "attemptId": "lpattempt_97875e29731b4496b1f5addf75015403",
+  "pmThreadId": "thr_byid867zci",
+  "writerThreadId": "thr_79seyzsyyz",
+  "ownsPaths": [
+    "bin/zcode-cli-acp.mjs",
+    "tests/zcode-cli-acp.test.mjs",
+    "tests/support/fake-zcode-cli.mjs"
+  ],
+  "readFirst": [
+    {
+      "path": "bin/zcode-cli-acp.mjs",
+      "windows": []
+    },
+    {
+      "path": "tests/zcode-cli-acp.test.mjs",
+      "windows": []
+    },
+    {
+      "path": "tests/support/fake-zcode-cli.mjs",
+      "windows": []
+    }
+  ],
+  "output": "`parseJsonResult` now matches the plan: whole stdout first, then from the last column-0 `{` to the end, then one line at a time. Compact `--json` still parses.\n\n**Changed paths**\n- `bin/zcode-cli-acp.mjs`\n- `tests/zcode-cli-acp.test.mjs`\n- `tests/support/fake-zcode-cli.mjs`\n\n**Checks (worktree, this session)**\n- `bash /tmp/zc-checks/zcode-cli-pretty-json.sh` → `pretty JSON parsed`, exit 0\n- `env TMPDIR=/tmp node --test tests/zcode-cli-acp.test.mjs` → 6 tests, exit 0\n\n```plan-fact\n[\n  {\"item\":1,\"status\":\"done\",\"evidence\":[\"bin/zcode-cli-acp.mjs:429-453\",\"cmd:bash /tmp/zc-checks/zcode-cli-pretty-json.sh\"]},\n  {\"item\":2,\"status\":\"done\",\"evidence\":[\"tests/zcode-cli-acp.test.mjs:89-102\",\"tests/support/fake-zcode-cli.mjs:53-57\",\"bin/zcode-cli-acp.mjs:435-442\"]},\n  {\"item\":3,\"status\":\"done\",\"evidence\":[\"cmd:env TMPDIR=/tmp node --test tests/zcode-cli-acp.test.mjs\"]}\n]\n```\n\nAPPROACH: Parse trimmed stdout as JSON, then the block from the last line that starts with `{`, then each line — that covers a notice plus pretty-printed `--json`.\nLESSON: The sandbox check must create its temp dir under `/tmp` (`TMPDIR=/tmp` and `mktemp -d /tmp/...`); default `$TMPDIR` on macOS (`/var/folders/...`) is not writable there.",
+  "verification": [
+    {
+      "command": "bash /tmp/zc-checks/zcode-cli-pretty-json.sh",
+      "exitCode": 0,
+      "stdout": "pretty JSON parsed\r\n",
+      "stderr": "",
+      "sandboxBackend": "macos-seatbelt",
+      "policySha256": "ab50b3459733f55afa6554d09aae8b2acaa51d56a3306bc631eda8825594b123",
+      "workspacePath": "/Users/vechkasov/.lane-pilot/worktrees/lpattempt_31737c64f0ec4cb38d96821c511f17dd/bb-plugin-zcode"
+    },
+    {
+      "command": "env TMPDIR=/tmp node --test tests/zcode-cli-acp.test.mjs",
+      "exitCode": 0,
+      "stdout": "✔ turn 1 argv and env, turn 2 resumes, usage and response, model dir after set_config_option (513.509458ms)\r\n✔ pretty-printed CLI JSON (FAKE_ZCODE_PRETTY=1) still yields the response and usage (203.450083ms)\r\n✔ a 20000-character prompt is passed with --attach and the file is removed after the turn (198.850708ms)\r\n✔ session/cancel during a sleeping turn returns cancelled and the fake process is gone (304.962709ms)\r\n✔ set-key writes encrypted credentials per model and never prints the dummy key (75.55275ms)\r\n✔ launcher exists next to the agent (0.117792ms)\r\nℹ tests 6\r\nℹ suites 0\r\nℹ pass 6\r\nℹ fail 0\r\nℹ cancelled 0\r\nℹ skipped 0\r\nℹ todo 0\r\nℹ duration_ms 1364.877584\r\n",
+      "stderr": "",
+      "sandboxBackend": "macos-seatbelt",
+      "policySha256": "d770878da945f5ca2ebc4ff23f3469f9502ea3a6625ffb95f85d3771140361c1",
+      "workspacePath": "/Users/vechkasov/.lane-pilot/worktrees/lpattempt_31737c64f0ec4cb38d96821c511f17dd/bb-plugin-zcode"
+    }
+  ],
+  "runV2": {
+    "schemaVersion": 1,
+    "pools": {
+      "provider": 15,
+      "verification": 2
+    },
+    "score": 2,
+    "risk": "low",
+    "sourceRisk": "low",
+    "scoreAdapter": "task-risk-v1"
+  },
+  "reasoning": [
+    {
+      "planSha256": "ed663b79509045caf66db119279da00ff4a7b5f7f3b3ac9a13b7635ae4338f0d",
+      "sentPlanSha256": null,
+      "sourceLength": 3676,
+      "sentLength": null,
+      "jevStatus": "disabled",
+      "jevDecision": null,
+      "requestedReasoningLevel": "medium",
+      "effectiveReasoningLevel": "medium",
+      "fallbackReason": "jev_disabled;jev_disabled_by_project_setting",
+      "retryEffort": {
+        "enabled": false,
+        "retryIndex": 0,
+        "before": "medium",
+        "after": "medium",
+        "changed": false
+      },
+      "providerId": "acp-cursor",
+      "model": "grok-4.6",
+      "serviceTier": "default",
+      "requestedServiceTier": "default",
+      "runId": "lprun_272b45ab4fab414c8d3b0e173ce08b9b",
+      "attemptId": "lpattempt_97875e29731b4496b1f5addf75015403",
+      "threadId": "thr_79seyzsyyz",
+      "effortMode": "manual",
+      "selectionSource": {
+        "providerId": "acp-cursor",
+        "model": "grok-4.6",
+        "reasoningLevel": "medium",
+        "serviceTier": "default",
+        "reasoningLevelSource": "explicit"
+      },
+      "dispatchContext": {
+        "memoryText": "- Project-life bookkeeping commits run only on main. PM writes to .agents/PROGRESS.md and .agents/CHANGELOG.md are guarded; PM guidance points to .agents/decisions/ and .agents/plans/.\n- themes/pokecut.css is generated from src/theme/base.css by `npm run build:theme`. `node scripts/build-theme.mjs --check` verifies that the generated file is in sync with its source.\n- Execution defaults can pin a chat environment as `folder` or `worktree`. Resolve the pin nearest-first across section, ancestors, project, and global settings. A `worktree` pin preselects a managed worktree on the folder host in both New chat and the composer chip; spawn must preserve that managed-worktree selection. With no pin, keep the existing folder/section-provider behavior. Groups must never become chat environments.",
+        "memoryPicked": [
+          "8c29d00234a4c4165616355505012f163e8eff147bf88e273bad0d05e1a77971",
+          "2340acb1ca447a89663271d4d3637d9cb6578c4ffcfef5885314e081c57406b5",
+          "39467d1db13cd0d2692a4e6c1934571d085dddc651a02deec6aeba4e0829c97b"
+        ],
+        "rulesText": "- When a feature adds or uses a new helper on the native-step helpers object, wire it in host/plugin.ts at every place the helpers are built and add a test against the real host wiring, not only a stubbed helper.",
+        "rulesPicked": {
+          "total": 19,
+          "picked": [
+            "rule_1a13871bdc9b0fa7"
+          ]
+        },
+        "executionPacket": "Read these before editing; they are the context for this task:\n- .agents/plans/zcode-cli-provider.md (not in the workspace; skip it)\n- README.md L1-L176 (sha256 48a55d0d)\n- server.ts L1-L182 (sha256 931115b2)",
+        "executionPacketSha256": "8d967a7265b4b6b31556a4e48a381881a80cc31d6c0e3c03cfc59389a331ec6c",
+        "pmReadContext": "",
+        "agent": "Lane Pilot writer",
+        "promptChars": 11125,
+        "helperMode": "roles",
+        "helperRequired": false,
+        "skillPick": {
+          "enabled": true,
+          "skills": [
+            "bb-plugin-authoring",
+            "zcode-control"
+          ],
+          "picked": [
+            {
+              "name": "bb-plugin-authoring",
+              "p": 0.83
+            },
+            {
+              "name": "zcode-control",
+              "p": 0.82
+            }
+          ],
+          "craft": [],
+          "projectFolder": [],
+          "hints": [],
+          "sources": {
+            "bb-plugin-authoring": "/home/ubuntu/.local/share/bb-server-runtime-0.48.1-vk.1/node_modules/bb-app/server/dist/builtin-plugins/bb-guide/skills/bb-plugin-authoring",
+            "zcode-control": "/Users/vechkasov/.agents/skills/zcode-control"
+          },
+          "reason": null,
+          "materialized": []
+        },
+        "writerKey": "acp-cursor/grok-4.6",
+        "harness": {
+          "id": "hrn_277109ba2e3c1a5d",
+          "arm": null,
+          "alwaysOnChars": 0,
+          "skills": [],
+          "checks": [],
+          "materialize": null
+        }
+      }
+    }
+  ],
+  "emergencyFallback": null,
+  "warnings": [
+    "the writer changed tests that existed before the attempt (reference tests): tests/support/fake-zcode-cli.mjs, tests/zcode-cli-acp.test.mjs — the critic checks they were not weakened"
+  ],
+  "turns": 3
+}
