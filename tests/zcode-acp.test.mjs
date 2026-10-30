@@ -405,3 +405,124 @@ test("MCP: oneOf tool schemas are flattened into one object (ZCode drops the ser
   await agent.request("session/close", { sessionId: s.sessionId });
   agent.close();
 });
+
+// ---------------------------------------------------------------- one provider: free via the window, paid via the ZCode CLI
+
+function setupCli({ cache = true, extraEnv = {} } = {}) {
+  const dir = fs.mkdtempSync(path.join("/tmp", "zcode-acp-cli-"));
+  if (cache) seedModels(dir);
+  const cwd = fs.mkdtempSync(path.join("/tmp", "zcode-acp-cli-cwd-"));
+  const cliHome = path.join(dir, "cli-home");
+  // A stored Coding Plan key as `zcode-cli-acp set-key` leaves it: <cli-home>/<model>/.zcode/v2/credentials.json. The agent only
+  // checks that the file exists; the real set-key command runs end to end in the task check.
+  for (const model of ["GLM-5.3-Flash", "GLM-5.3"]) {
+    fs.mkdirSync(path.join(cliHome, model, ".zcode", "v2"), { recursive: true });
+    fs.writeFileSync(path.join(cliHome, model, ".zcode", "v2", "credentials.json"), "{}\n", { mode: 0o600 });
+  }
+  const rec = path.join(dir, "record");
+  fs.mkdirSync(rec);
+  const env = {
+    HOME: dir,
+    ZCODE_ACP_BRIDGE: fakePath,
+    FAKE_ZC_DIR: dir,
+    FAKE_ZC_ROOT: fs.realpathSync(cwd),
+    ZCODE_ACP_SESSIONS: path.join(dir, "sessions.json"),
+    ZCODE_CLI_ENTRY: path.join(here, "support", "fake-zcode-cli.mjs"),
+    ZCODE_CLI_HOME: cliHome,
+    ZCODE_CLI_ACP_SESSIONS: path.join(dir, "cli-sessions.json"),
+    FAKE_ZCODE_RECORD: rec,
+    FAKE_ZCODE_RESPONSE: "cli-answer",
+    ...extraEnv,
+  };
+  const agent = startAgent(process.execPath, [agentPath], env);
+  return {
+    dir,
+    cwd,
+    agent,
+    rec,
+    calls: () => (fs.existsSync(path.join(dir, "calls.log")) ? fs.readFileSync(path.join(dir, "calls.log"), "utf8").split("\n").filter((l) => l.startsWith("send ")) : []),
+    cliTurns: () => fs.readdirSync(rec).filter((f) => /^turn-\d+\.json$/.test(f)),
+  };
+}
+
+test("with a stored Coding Plan key the model list shows the · Paid tariffs, also when the model cache is missing", async () => {
+  const { agent } = setupCli({ cache: false });
+  await agent.request("initialize", { protocolVersion: 1 });
+  const s = await agent.request("session/new", { cwd: "/tmp", mcpServers: [] });
+  const names = s.configOptions.find((o) => o.category === "model").options.map((o) => o.name);
+  assert.deepEqual(names, ["GLM-5.3-Flash · Paid", "GLM-5.3-Flash · Free", "GLM-5.3 · Paid"]);
+  assert.equal(names.length, 3);
+  agent.close();
+});
+
+test("with a stored key a turn on glm-5.3-flash runs through the ZCode CLI, the window gets no send, and the client sees the CLI's answer", async () => {
+  const { agent, cwd, dir, rec, calls, cliTurns } = setupCli();
+  try {
+    await agent.request("initialize", { protocolVersion: 1 });
+    const s = await agent.request("session/new", { cwd, mcpServers: [] });
+    await agent.request("session/set_config_option", { sessionId: s.sessionId, configId: "model", value: "glm-5.3-flash" });
+    const r = await prompt(agent, s.sessionId, "paid hello");
+    assert.equal(r.stopReason, "end_turn");
+    assert.equal(cliTurns().length, 1, "the CLI ran the turn");
+    assert.equal(calls().length, 0, "the window bridge was not used");
+    assert.ok(text(agent.updates).includes("cli-answer"));
+    const turn = JSON.parse(fs.readFileSync(path.join(rec, "turn-1.json"), "utf8"));
+    assert.ok(turn.argv.includes(cwd), "the CLI runs in the chat folder");
+    assert.equal(turn.env.ZCODE_DATA_BASE_DIR, path.join(dir, "cli-home", "GLM-5.3-Flash"));
+  } finally {
+    agent.close();
+  }
+});
+
+test("with a stored key a turn on glm-5.3-flash-free still runs through the window with --route free and does not start the CLI", async () => {
+  const { agent, cwd, calls, cliTurns } = setupCli();
+  try {
+    await agent.request("initialize", { protocolVersion: 1 });
+    const s = await agent.request("session/new", { cwd, mcpServers: [] });
+    await agent.request("session/set_config_option", { sessionId: s.sessionId, configId: "model", value: "glm-5.3-flash-free" });
+    const r = await prompt(agent, s.sessionId, "free hello");
+    assert.equal(r.stopReason, "end_turn");
+    assert.match(calls()[0], / --route free/);
+    assert.equal(cliTurns().length, 0, "the CLI was not started");
+  } finally {
+    agent.close();
+  }
+});
+
+test("without a stored key a turn on glm-5.3-flash runs through the window with --route plan", async () => {
+  const { agent, cwd, calls } = setup();
+  try {
+    await agent.request("initialize", { protocolVersion: 1 });
+    const s = await agent.request("session/new", { cwd, mcpServers: [] });
+    await agent.request("session/set_config_option", { sessionId: s.sessionId, configId: "model", value: "glm-5.3-flash" });
+    const r = await prompt(agent, s.sessionId, "plain hello");
+    assert.equal(r.stopReason, "end_turn");
+    const send = calls().find((c) => c.startsWith("send "));
+    assert.match(send, /--model GLM-5.3-Flash /);
+    assert.match(send, /--route plan(\s|$)/);
+  } finally {
+    agent.close();
+  }
+});
+
+test("when the CLI child agent exits, the next paid turn starts a new child and succeeds", async () => {
+  const { agent, cwd, dir, cliTurns } = setupCli();
+  try {
+    await agent.request("initialize", { protocolVersion: 1 });
+    const s = await agent.request("session/new", { cwd, mcpServers: [] });
+    await agent.request("session/set_config_option", { sessionId: s.sessionId, configId: "model", value: "glm-5.3" });
+    const first = await prompt(agent, s.sessionId, "paid one");
+    assert.equal(first.stopReason, "end_turn");
+    // The child agent's pid is in the agent's own log; kill it between turns (no process-table tools: the sandbox denies them).
+    const pid = Number(fs.readFileSync(path.join(dir, ".zcode-bridge", "acp.log"), "utf8").match(/zcode-cli-acp child agent pid (\d+)/)[1]);
+    assert.ok(pid > 0, "the child agent pid is logged");
+    process.kill(pid, "SIGKILL");
+    await new Promise((r) => setTimeout(r, 200));
+    const second = await prompt(agent, s.sessionId, "paid two");
+    assert.equal(second.stopReason, "end_turn");
+    assert.equal(cliTurns().length, 2, "both turns reached the CLI");
+    assert.ok(text(agent.updates).includes("cli-answer"));
+  } finally {
+    agent.close();
+  }
+});
