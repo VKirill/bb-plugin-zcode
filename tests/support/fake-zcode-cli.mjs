@@ -39,16 +39,19 @@ if (process.env.FAKE_ZCODE_FAIL === "model") {
 const sleepMs = Number(process.env.FAKE_ZCODE_SLEEP_MS || 0);
 if (sleepMs > 0) await new Promise((r) => setTimeout(r, sleepMs));
 const sessionId = process.env.FAKE_ZCODE_SESSION_ID || "sess_fake_1";
-process.stdout.write(
-  JSON.stringify({
-    sessionId,
-    traceId: "tr_fake",
-    turnId: `turn_${n}`,
-    response: process.env.FAKE_ZCODE_RESPONSE || "fake-response",
-    usage: {
-      inputTokens: Number(process.env.FAKE_ZCODE_INPUT || 11),
-      outputTokens: Number(process.env.FAKE_ZCODE_OUTPUT || 7),
-      cacheReadTokens: Number(process.env.FAKE_ZCODE_CACHE || 3),
-    },
-  }) + "\n",
-);
+const payload = {
+  sessionId,
+  traceId: "tr_fake",
+  turnId: `turn_${n}`,
+  response: process.env.FAKE_ZCODE_RESPONSE || "fake-response",
+  usage: {
+    inputTokens: Number(process.env.FAKE_ZCODE_INPUT || 11),
+    outputTokens: Number(process.env.FAKE_ZCODE_OUTPUT || 7),
+    cacheReadTokens: Number(process.env.FAKE_ZCODE_CACHE || 3),
+  },
+};
+if (process.env.FAKE_ZCODE_PRETTY === "1") {
+  process.stdout.write("ZCode Built-in skipped (not-due)\n" + JSON.stringify(payload, null, 2) + "\n");
+} else {
+  process.stdout.write(JSON.stringify(payload) + "\n");
+}

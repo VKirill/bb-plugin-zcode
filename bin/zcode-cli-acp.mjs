@@ -422,19 +422,30 @@ function applyParts(s, rows, silent) {
 function killGroup(child) {
   if (!child?.pid) return;
   try {
-    process.kill(-child.pid, "SIGTERM");
-  } catch {
-    try {
-      child.kill("SIGTERM");
-    } catch {}
-  }
+    child.kill("SIGTERM");
+  } catch {}
 }
 
 function parseJsonResult(out) {
-  const lines = String(out).trim().split("\n").filter(Boolean);
-  for (let i = lines.length - 1; i >= 0; i--) {
+  const s = String(out);
+  try {
+    const j = JSON.parse(s.trim());
+    if (j && typeof j === "object") return j;
+  } catch {}
+  const lines = s.split("\n");
+  let from = -1;
+  for (let i = 0; i < lines.length; i++) if (lines[i].startsWith("{")) from = i;
+  if (from >= 0) {
     try {
-      const j = JSON.parse(lines[i]);
+      const j = JSON.parse(lines.slice(from).join("\n"));
+      if (j && typeof j === "object") return j;
+    } catch {}
+  }
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i].trim();
+    if (!line) continue;
+    try {
+      const j = JSON.parse(line);
       if (j && typeof j === "object") return j;
     } catch {}
   }
@@ -462,12 +473,14 @@ function runTurn(s, promptText) {
     args.push("--attach", attachFile);
   }
   if (s.zcodeSessionId) args.push("--resume", s.zcodeSessionId);
-  const child = spawn(process.execPath, [CLI_ENTRY, ...args], { env: cliEnv(model), detached: true, stdio: ["ignore", "pipe", "pipe"] });
+  const child = spawn(process.execPath, [CLI_ENTRY, ...args], { env: cliEnv(model), stdio: ["ignore", "pipe", "pipe"] });
   s.active = { child, attachFile };
   let stdout = "";
   let stderr = "";
-  child.stdout.on("data", (d) => (stdout += d));
-  child.stderr.on("data", (d) => (stderr += d));
+  child.stdout?.setEncoding("utf8");
+  child.stderr?.setEncoding("utf8");
+  child.stdout?.on("data", (d) => (stdout += d));
+  child.stderr?.on("data", (d) => (stderr += d));
   const poll = setInterval(() => {
     if (s.zcodeSessionId) applyParts(s, sqliteParts(s.zcodeSessionId, s.watchSince || 0), false);
   }, 400);
@@ -479,14 +492,17 @@ function runTurn(s, promptText) {
       fn();
     };
     child.on("error", (e) => finish(() => reject(new AcpError(-32603, `zcode CLI: ${e.message}`))));
-    child.on("close", (code, signal) => {
+    child.on("close", (code) => {
       finish(() => {
-        if (s.cancelled || signal) return resolve({ cancelled: true });
-        if (code !== 0 || /project_token_login_failed|Select a model/.test(stderr)) {
+        const json = parseJsonResult(stdout);
+        if (s.cancelled && !json) return resolve({ cancelled: true });
+        if (!s.cancelled && (code !== 0 || /project_token_login_failed|Select a model/.test(stderr))) {
           return reject(new AcpError(-32000, `${KEY_ERROR} (${(stderr || stdout || `exit ${code}`).trim().slice(-200)})`));
         }
-        const json = parseJsonResult(stdout);
-        if (!json) return reject(new AcpError(-32603, `ZCode CLI produced no JSON: ${(stderr || stdout).trim().slice(-300)}`));
+        if (!json) {
+          if (s.cancelled) return resolve({ cancelled: true });
+          return reject(new AcpError(-32603, `ZCode CLI produced no JSON: ${(stderr || stdout).trim().slice(-300)}`));
+        }
         resolve({ json });
       });
     });
