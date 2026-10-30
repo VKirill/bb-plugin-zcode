@@ -1,3 +1,4 @@
 # Changelog
 
 - 2026-10-30 lprun_272b45ab4fab414c8d3b0e173ce08b9b: Added the ZCode CLI provider — a second BB provider running ZCode's bundled CLI headless with a Coding Plan API key (`zcode-cli-acp` with `set-key`/`status`, per-model data dirs, resume, streaming, cancel, tests, README EN/RU) side by side with the window provider. (zcode-cli-provider-key; commit: see git log)
+- 2026-10-30 lprun_272b45ab4fab414c8d3b0e173ce08b9b: One ZCode provider instead of two — the separate `zcode-cli` BB provider was removed, «· Paid» models (GLM-5.3-Flash, GLM-5.3) run through the ZCode CLI when a Coding Plan key is stored (window fallback without a key), and `zcode-cli-acp` parses the CLI's pretty-printed `--json` result so real CLI turns succeed. (zcode-cli-pretty-json, zcode-cli-pretty-json-fix, zcode-one-provider.3; commit: see git log)
