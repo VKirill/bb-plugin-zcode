@@ -10,6 +10,8 @@ export { rpcContract } from "./contract.js";
 // for a machine that keeps the command somewhere else.
 export const ZCODE_PROVIDER_ID = "zcode";
 export const ZCODE_AGENT_COMMAND = "zcode-acp";
+export const ZCODE_CLI_PROVIDER_ID = "zcode-cli";
+export const ZCODE_CLI_AGENT_COMMAND = "zcode-cli-acp";
 
 export const MODE_OPTIONS = ["full", "auto", "ask", "plan"];
 
@@ -149,12 +151,59 @@ export default function plugin(bb: BbPluginApi): void {
     composerActions: [],
   });
 
-  bb.providers.experimental_contributeEnv(ZCODE_PROVIDER_ID, async () => {
+  bb.providers.register({
+    id: ZCODE_CLI_PROVIDER_ID,
+    displayName: "ZCode CLI",
+    icon: "./icons/zcode.svg",
+    family: "acp",
+    strings: {
+      signInHint: "Store a Coding Plan API key with `zcode-cli-acp set-key` (stdin). The desktop app stays signed in. / Сохраните ключ Coding Plan: `zcode-cli-acp set-key` (stdin). Десктопное приложение остаётся в сессии.",
+      expiredHint: "The Coding Plan API key is missing or rejected. Run `zcode-cli-acp set-key`. / Ключ Coding Plan отсутствует или отклонён. Выполните `zcode-cli-acp set-key`.",
+      installUrl: "https://zcode.z.ai",
+    },
+    experimental_visibility: "installed",
+    experimental_bridgeOptions: {
+      acpLaunchSpec: { displayName: "ZCode CLI", command: ZCODE_CLI_AGENT_COMMAND, args: [], env: {} },
+    },
+    deriveProviderOptions() {
+      return {
+        acpLaunchSpec: {
+          displayName: "ZCode CLI",
+          command: ZCODE_CLI_AGENT_COMMAND,
+          args: [],
+          env: {},
+          permissionCli: { full: ["--bb-permission=full"], workspaceWrite: ["--bb-permission=accept-edits"] },
+        } as JsonValue,
+      };
+    },
+    models: { scope: "host" },
+    maintenance: { health: true, usage: false, installation: false },
+    capabilities: {
+      supportsServiceTier: false,
+      supportsNativeUserQuestion: false,
+      supportsManualCompaction: false,
+      supportsThreadArchive: false,
+      supportsThreadRename: false,
+      fork: "none",
+      permissionModes: ["accept-edits", "full"],
+      reasoningLevels: ["low", "high", "max"],
+    },
+    reasoningLevels: [
+      { id: "low", label: "Low" },
+      { id: "high", label: "High" },
+      { id: "max", label: "Max" },
+    ],
+    composerActions: [],
+  });
+
+  const contributeAgentEnv = async (reason: string) => {
     const env = agentEnv(await settings.get());
     return Object.entries(env)
       .filter(([, value]) => value !== "")
-      .map(([name, value]) => ({ name, value, reason: "ZCode provider setting" }));
-  });
+      .map(([name, value]) => ({ name, value, reason }));
+  };
+  bb.providers.experimental_contributeEnv(ZCODE_PROVIDER_ID, () => contributeAgentEnv("ZCode provider setting"));
+  bb.providers.experimental_contributeEnv(ZCODE_CLI_PROVIDER_ID, () => contributeAgentEnv("ZCode CLI provider setting"));
 
   bb.rpc.register(rpcContract, {
     async hosts({ refresh, hostId }) {

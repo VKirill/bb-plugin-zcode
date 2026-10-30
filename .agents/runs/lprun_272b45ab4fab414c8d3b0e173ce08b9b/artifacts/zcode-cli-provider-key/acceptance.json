@@ -1,0 +1,15 @@
+{
+  "schema_version": 2,
+  "task_id": "zcode-cli-provider-key",
+  "task_sha256": "95d6743d1ec3e35a3984cb05dae8333f5f457982a0d7f9a8336ff8bf6c17b21f",
+  "attempt": 1,
+  "provider_exit": 0,
+  "report": "complete",
+  "report_sha256": "95be3b6ac919ee053caa32ca281584febe23d84ef5c3d3c6b36628154d5822a0",
+  "owns_check": "passed",
+  "verification": "passed",
+  "review": "passed",
+  "accepted": true,
+  "accepted_at": "2026-10-30T10:01:54.579Z",
+  "model": "grok-4.6"
+}

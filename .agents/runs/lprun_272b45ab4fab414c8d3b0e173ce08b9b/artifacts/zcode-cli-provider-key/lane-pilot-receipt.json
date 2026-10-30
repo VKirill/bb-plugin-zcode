@@ -1,0 +1,195 @@
+{
+  "schemaVersion": 1,
+  "status": "accepted",
+  "lanePilotRunId": "lprun_272b45ab4fab414c8d3b0e173ce08b9b",
+  "lanePilotTaskId": "zcode-cli-provider-key",
+  "attemptId": "lpattempt_31737c64f0ec4cb38d96821c511f17dd",
+  "pmThreadId": "thr_byid867zci",
+  "writerThreadId": "thr_79seyzsyyz",
+  "ownsPaths": [
+    "bin/zcode-cli-acp.mjs",
+    "bin/zcode-cli-acp",
+    "bin/zcode-acp.mjs",
+    "tests/zcode-cli-acp.test.mjs",
+    "tests/support/fake-zcode-cli.mjs",
+    "server.ts",
+    "host.ts",
+    "contract.ts",
+    "app.tsx",
+    "scripts/install.sh",
+    "README.md"
+  ],
+  "readFirst": [
+    {
+      "path": ".agents/plans/zcode-cli-provider.md",
+      "windows": []
+    },
+    {
+      "path": "README.md",
+      "windows": []
+    },
+    {
+      "path": "server.ts",
+      "windows": []
+    },
+    {
+      "path": "bin/zcode-acp",
+      "windows": []
+    },
+    {
+      "path": "bin/zcode-acp.mjs",
+      "windows": []
+    },
+    {
+      "path": "tests/zcode-acp.test.mjs",
+      "windows": []
+    },
+    {
+      "path": "tests/support/fake-zcbridge.mjs",
+      "windows": []
+    },
+    {
+      "path": "tests/support/acp-client.mjs",
+      "windows": []
+    },
+    {
+      "path": "scripts/install.sh",
+      "windows": []
+    }
+  ],
+  "output": "ZCode CLI is a second BB provider (`zcode-cli`) next to the window provider. Chats spawn the bundled CLI headless with a Coding Plan key from `zcode-cli-acp set-key`; later turns use `--resume`. The desktop store `~/.zcode/v2` is never touched.\n\n**Changed paths**\n- `bin/zcode-cli-acp.mjs`\n- `bin/zcode-cli-acp`\n- `tests/zcode-cli-acp.test.mjs`\n- `tests/support/fake-zcode-cli.mjs`\n- `server.ts`\n- `scripts/install.sh`\n- `README.md`\n\n**Checks** (`node --test tests/zcode-cli-acp.test.mjs`, `npx tsc --noEmit`, README/install greps): all exited 0.\n\nLeft unchanged on purpose: `host.ts`, `contract.ts`, `app.tsx`, `bin/zcode-acp.mjs`, `bin/zcbridge`.\n\n```plan-fact\n[\n  {\"item\":1,\"status\":\"done\",\"evidence\":[\"bin/zcode-cli-acp.mjs:454-465\",\"tests/zcode-cli-acp.test.mjs:68-81\",\"cmd:node --test tests/zcode-cli-acp.test.mjs\"]},\n  {\"item\":2,\"status\":\"done\",\"evidence\":[\"bin/zcode-cli-acp.mjs:445-451\",\"tests/zcode-cli-acp.test.mjs:74-83\",\"cmd:node --test tests/zcode-cli-acp.test.mjs\"]},\n  {\"item\":3,\"status\":\"done\",\"evidence\":[\"bin/zcode-cli-acp.mjs:458-463\",\"bin/zcode-cli-acp.mjs:476-478\",\"tests/zcode-cli-acp.test.mjs:89-106\",\"cmd:node --test tests/zcode-cli-acp.test.mjs\"]},\n  {\"item\":4,\"status\":\"done\",\"evidence\":[\"bin/zcode-cli-acp.mjs:512-519\",\"tests/zcode-cli-acp.test.mjs:63-67\",\"cmd:node --test tests/zcode-cli-acp.test.mjs\"]},\n  {\"item\":5,\"status\":\"done\",\"evidence\":[\"bin/zcode-cli-acp.mjs:425-433\",\"bin/zcode-cli-acp.mjs:505\",\"bin/zcode-cli-acp.mjs:526-528\",\"tests/zcode-cli-acp.test.mjs:108-136\",\"cmd:node --test tests/zcode-cli-acp.test.mjs\"]},\n  {\"item\":6,\"status\":\"done\",\"evidence\":[\"bin/zcode-cli-acp.mjs:78-114\",\"tests/zcode-cli-acp.test.mjs:138-171\",\"cmd:node --test tests/zcode-cli-acp.test.mjs\"]},\n  {\"item\":7,\"status\":\"done\",\"evidence\":[\"server.ts:106-108\",\"server.ts:154-157\"]},\n  {\"item\":8,\"status\":\"done\",\"evidence\":[\"scripts/install.sh:74-76\",\"cmd:grep -q 'zcode-cli-acp' scripts/install.sh\"]},\n  {\"item\":9,\"status\":\"done\",\"evidence\":[\"README.md:112-119\",\"README.md:180-187\",\"cmd:grep -q '^## ZCode CLI provider' README.md && grep -q '^## Провайдер ZCode CLI' README.md && grep -q 'zcode-cli-acp set-key' README.md\"]}\n]\n```\n\nAPPROACH: Mirror `zcode-acp` over stdio, spawn the bundled CLI with a per-model data dir and `HOME` unchanged, persist `--resume`, and keep Coding Plan credentials only under `ZCODE_CLI_HOME`.\nLESSON: The CLI’s credential key is `sha256` of a string that uses `os.homedir()`, so tests that set `HOME` must decrypt with that same home, not the parent process’s.",
+  "verification": [
+    {
+      "command": "node --test tests/zcode-cli-acp.test.mjs",
+      "exitCode": 0,
+      "stdout": "✔ turn 1 argv and env, turn 2 resumes, usage and response, model dir after set_config_option (629.621666ms)\r\n✔ a 20000-character prompt is passed with --attach and the file is removed after the turn (219.383ms)\r\n✔ session/cancel during a sleeping turn returns cancelled and the fake process is gone (306.153583ms)\r\n✔ set-key writes encrypted credentials per model and never prints the dummy key (103.533167ms)\r\n✔ launcher exists next to the agent (0.126416ms)\r\nℹ tests 5\r\nℹ suites 0\r\nℹ pass 5\r\nℹ fail 0\r\nℹ cancelled 0\r\nℹ skipped 0\r\nℹ todo 0\r\nℹ duration_ms 1336.278209\r\n",
+      "stderr": "",
+      "sandboxBackend": "macos-seatbelt",
+      "policySha256": "bf7a362fb15101dab14c14b26e9356159ca2891ed5c1527b4525327b5416b3da",
+      "workspacePath": "/Users/vechkasov/.lane-pilot/worktrees/lpattempt_31737c64f0ec4cb38d96821c511f17dd/bb-plugin-zcode"
+    },
+    {
+      "command": "npx tsc --noEmit",
+      "exitCode": 0,
+      "stdout": "\\\u001b[1G\u001b[0K\u001b[1mnpm\u001b[22m \u001b[96mnotice\u001b[39m\r\n\u001b[1mnpm\u001b[22m \u001b[96mnotice\u001b[39m New \u001b[31mmajor\u001b[39m version of npm available! \u001b[31m11.16.0\u001b[39m -> \u001b[34m12.2.1\u001b[39m\r\n\u001b[1mnpm\u001b[22m \u001b[96mnotice\u001b[39m Changelog: \u001b[34mhttps://github.com/npm/cli/releases/tag/v12.2.1\u001b[39m\r\n\u001b[1mnpm\u001b[22m \u001b[96mnotice\u001b[39m To update run: \u001b[4mnpm install -g npm@12.2.1\u001b[24m\r\n\u001b[1mnpm\u001b[22m \u001b[96mnotice\u001b[39m\r\n\\\u001b[1G\u001b[0K",
+      "stderr": "",
+      "sandboxBackend": "macos-seatbelt",
+      "policySha256": "92a9094f350b0d399943ae4b1fe356117c8a8354a48e3076b33a1607310a5735",
+      "workspacePath": "/Users/vechkasov/.lane-pilot/worktrees/lpattempt_31737c64f0ec4cb38d96821c511f17dd/bb-plugin-zcode"
+    },
+    {
+      "command": "grep -q '^## ZCode CLI provider' README.md && grep -q '^## Провайдер ZCode CLI' README.md && grep -q 'zcode-cli-acp set-key' README.md && grep -q 'zcode-cli-acp' scripts/install.sh",
+      "exitCode": 0,
+      "stdout": "",
+      "stderr": "",
+      "sandboxBackend": "macos-seatbelt",
+      "policySha256": "e9645c7f9c6ea0737ca3bb4ab1bf616f9ea047cfa45532da67df01bf9120f2ed",
+      "workspacePath": "/Users/vechkasov/.lane-pilot/worktrees/lpattempt_31737c64f0ec4cb38d96821c511f17dd/bb-plugin-zcode"
+    }
+  ],
+  "runV2": {
+    "schemaVersion": 1,
+    "pools": {
+      "provider": 15,
+      "verification": 2
+    },
+    "score": 5,
+    "risk": "medium",
+    "sourceRisk": "medium",
+    "scoreAdapter": "task-risk-v1"
+  },
+  "reasoning": [
+    {
+      "planSha256": "ed663b79509045caf66db119279da00ff4a7b5f7f3b3ac9a13b7635ae4338f0d",
+      "sentPlanSha256": null,
+      "sourceLength": 3676,
+      "sentLength": null,
+      "jevStatus": "disabled",
+      "jevDecision": null,
+      "requestedReasoningLevel": "medium",
+      "effectiveReasoningLevel": "medium",
+      "fallbackReason": "jev_disabled;jev_disabled_by_project_setting",
+      "retryEffort": {
+        "enabled": false,
+        "retryIndex": 0,
+        "before": "medium",
+        "after": "medium",
+        "changed": false
+      },
+      "providerId": "acp-cursor",
+      "model": "grok-4.6",
+      "serviceTier": "default",
+      "requestedServiceTier": "default",
+      "runId": "lprun_272b45ab4fab414c8d3b0e173ce08b9b",
+      "attemptId": "lpattempt_31737c64f0ec4cb38d96821c511f17dd",
+      "threadId": "thr_79seyzsyyz",
+      "effortMode": "manual",
+      "selectionSource": {
+        "providerId": "acp-cursor",
+        "model": "grok-4.6",
+        "reasoningLevel": "medium",
+        "serviceTier": "default",
+        "reasoningLevelSource": "explicit"
+      },
+      "dispatchContext": {
+        "memoryText": "- Project-life bookkeeping commits run only on main. PM writes to .agents/PROGRESS.md and .agents/CHANGELOG.md are guarded; PM guidance points to .agents/decisions/ and .agents/plans/.\n- themes/pokecut.css is generated from src/theme/base.css by `npm run build:theme`. `node scripts/build-theme.mjs --check` verifies that the generated file is in sync with its source.\n- Execution defaults can pin a chat environment as `folder` or `worktree`. Resolve the pin nearest-first across section, ancestors, project, and global settings. A `worktree` pin preselects a managed worktree on the folder host in both New chat and the composer chip; spawn must preserve that managed-worktree selection. With no pin, keep the existing folder/section-provider behavior. Groups must never become chat environments.",
+        "memoryPicked": [
+          "8c29d00234a4c4165616355505012f163e8eff147bf88e273bad0d05e1a77971",
+          "2340acb1ca447a89663271d4d3637d9cb6578c4ffcfef5885314e081c57406b5",
+          "39467d1db13cd0d2692a4e6c1934571d085dddc651a02deec6aeba4e0829c97b"
+        ],
+        "rulesText": "- When a feature adds or uses a new helper on the native-step helpers object, wire it in host/plugin.ts at every place the helpers are built and add a test against the real host wiring, not only a stubbed helper.",
+        "rulesPicked": {
+          "total": 19,
+          "picked": [
+            "rule_1a13871bdc9b0fa7"
+          ]
+        },
+        "executionPacket": "Read these before editing; they are the context for this task:\n- .agents/plans/zcode-cli-provider.md (not in the workspace; skip it)\n- README.md L1-L176 (sha256 48a55d0d)\n- server.ts L1-L182 (sha256 931115b2)",
+        "executionPacketSha256": "8d967a7265b4b6b31556a4e48a381881a80cc31d6c0e3c03cfc59389a331ec6c",
+        "pmReadContext": "",
+        "agent": "Lane Pilot writer",
+        "promptChars": 11125,
+        "helperMode": "roles",
+        "helperRequired": false,
+        "skillPick": {
+          "enabled": true,
+          "skills": [
+            "bb-plugin-authoring",
+            "zcode-control"
+          ],
+          "picked": [
+            {
+              "name": "bb-plugin-authoring",
+              "p": 0.83
+            },
+            {
+              "name": "zcode-control",
+              "p": 0.82
+            }
+          ],
+          "craft": [],
+          "projectFolder": [],
+          "hints": [],
+          "sources": {
+            "bb-plugin-authoring": "/home/ubuntu/.local/share/bb-server-runtime-0.48.1-vk.1/node_modules/bb-app/server/dist/builtin-plugins/bb-guide/skills/bb-plugin-authoring",
+            "zcode-control": "/Users/vechkasov/.agents/skills/zcode-control"
+          },
+          "reason": null,
+          "materialized": []
+        },
+        "writerKey": "acp-cursor/grok-4.6",
+        "harness": {
+          "id": "hrn_277109ba2e3c1a5d",
+          "arm": null,
+          "alwaysOnChars": 0,
+          "skills": [],
+          "checks": [],
+          "materialize": null
+        }
+      }
+    }
+  ],
+  "emergencyFallback": null,
+  "turns": 1
+}

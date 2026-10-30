@@ -22,7 +22,7 @@ What `scripts/install.sh` does (`--dry-run` prints it without doing it; `--unins
 
 1. checks macOS, ZCode, Python 3, Node 20+, `swiftc`;
 2. builds the accessibility helper `zcax` from `native/zcax.swift`;
-3. copies `zcbridge`, `zcax`, `zcode-acp` to `~/.local/share/zcode-bridge` and links them into `--bin-dir` (default `~/.local/bin`; BB's host daemon must have that folder on its PATH, or set the plugin setting **Agent command** to the full path);
+3. copies `zcbridge`, `zcax`, `zcode-acp`, `zcode-cli-acp` to `~/.local/share/zcode-bridge` and links them into `--bin-dir` (default `~/.local/bin`; BB's host daemon must have that folder on its PATH, or set the plugin setting **Agent command** to the full path);
 4. `--default-mode ask|auto|full` writes `~/.zcode-bridge/config.json` (the mode `zcbridge send` uses when you name none);
 5. `--rewards-job` installs a LaunchAgent that claims ZCode's daily token banner (see below);
 6. runs `bb plugin install` for this checkout (skip with `--no-plugin`; or install from the BB Community marketplace once listed).
@@ -109,6 +109,19 @@ Each turn ends with ACP `usage` and a `usage_update` carrying input, cache-read,
 
 `zcbridge --help` lists everything: `doctor`, `send`, `continue`, `status`, `wait`, `watch`, `result`, `cancel`, `approvals`, `approve`, `deny`, `archive`, `tasks`, `projects`, `project-add`, `project-remove`, `models`, `usage [--quota]`, `route`, `rewards`, `mode-reset`, `slots`, `automations`, `capabilities`, `ui`, `version`. Every command prints one JSON object. An agent skill describing the safe use is in [`docs/skill/SKILL.md`](docs/skill/SKILL.md) (copy it to `~/.claude/skills/zcode-control/`).
 
+## ZCode CLI provider
+
+A second provider, **ZCode CLI**, runs the same GLM models through ZCode's bundled CLI (headless). It sits next to the window provider: pick "ZCode CLI" in a BB chat. The desktop app stays signed in; this path never reads or writes `~/.zcode/v2`.
+
+Setup (Coding Plan API key only; Start Plan is not available here):
+
+```sh
+zcode-cli-acp set-key   # paste the key, then Ctrl-D
+zcode-cli-acp status
+```
+
+The key is stored under `~/.zcode-bridge/cli-home/<model>/.zcode/v2/` (encrypted, mode 0600) and is never printed. Each turn is `node …/zcode.cjs -p … --json --mode … --cwd …` with `--resume` on later turns of the same chat.
+
 ## Limits
 
 - It drives a GUI. A ZCode update that renames a button or moves a menu can break a step (`ui_element_missing`, `mode_not_set`); run `zcbridge ui` to see the labels. Tested with ZCode 3.16.3 (English UI).
@@ -163,6 +176,19 @@ Apache-2.0, see [LICENSE](LICENSE). ZCode and Z.ai are trademarks of their owner
 **Проекты:** чат работает в проекте ZCode своей папки (или git-репозитория, в котором она лежит). Неизвестная папка регистрируется сама через ссылку `zcode://workspace/open`: ZCode показывает своё окно подтверждения, мост нажимает «Open folder» через Accessibility. Кириллица в путях работает, клавиши не нужны, база ZCode не пишется. `zcbridge project-remove DIR` убирает проект из списка (файлы папки не трогаются).
 
 **MCP чата:** серверы MCP, которые BB передаёт треду, на время сессии пишутся в `<проект>/.zcode/config.json` (права 0600), `.zcode/` сначала добавляется в `info/exclude` репозитория (общий для worktree), чтобы токены не попали в коммит; файл, который уже отслеживает git, не трогается; записи убираются при завершении сессии, выходе процесса и при следующем старте после сбоя.
+
+## Провайдер ZCode CLI
+
+Второй провайдер **ZCode CLI** гоняет те же модели GLM через встроенный CLI ZCode (без окна), рядом с оконным. Выберите «ZCode CLI» в чате BB. Десктопное приложение остаётся в сессии; `~/.zcode/v2` не читается и не пишется.
+
+Настройка (только ключ Coding Plan, без Start Plan):
+
+```sh
+zcode-cli-acp set-key   # вставьте ключ, затем Ctrl-D
+zcode-cli-acp status
+```
+
+Ключ лежит в `~/.zcode-bridge/cli-home/<модель>/.zcode/v2/` (шифруется, права 0600) и в вывод не попадает.
 
 **Ограничения:** это управление через интерфейс, обновление ZCode может сломать шаг; нужен разблокированный экран и не спящий Mac; каждая задача ZCode стоит около 40k входных токенов; ответ приходит по шагам модели, а не по токенам.
 
